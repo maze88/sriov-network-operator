@@ -30,7 +30,7 @@ jobs:
         head: master                 # upstream
         base: ${{ env.most_recent_release_branch }}  # downstream
         pr_title: "task: Sync from upstream"
-        pr_message: ${{ env.PR_MESSAGE_FOR_BOTH_JOBS }}
+        pr_message: "${{ env.PR_MESSAGE_FOR_BOTH_JOBS }}"
         ignore_fail: true  # TODO: add a condition to this step, in order to avoid the 4 minute wait when no changes detected in upstream
       timeout-minutes: 1       # TODO: remove this before merging, in order to maintain informative output message
       continue-on-error: true  # TODO: remove this before merging, in order to maintain informative output message
@@ -55,15 +55,13 @@ jobs:
         git checkout -b feature/update-sriov-to-${MOST_RECENT_RELEASE_BRANCH:17}-${{ github.run_id }}  # TODO: remove run id suffix before merging
         sed -Ei "s/:network-operator-.+/:$MOST_RECENT_RELEASE_BRANCH/g" deployment/network-operator/values.yaml
         git commit -am "task: update SR-IOV images tags to ${MOST_RECENT_RELEASE_BRANCH:17} in chart values"
-        git log -n 3  # debug
         # git push
     - name: Create pull request  # TODO: run idempotently or conditionally if diff
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # TODO: add to repo settings
       run: |
-        git branch  # TODO validate we are still on branch from previous step
         gh pr create \
           --repo Mmmmmellanox/network-operator \
           --base master \
           --fill \
-          --dry-run --body $PR_MESSAGE_FOR_BOTH_JOBS  # TODO: remove dry-run when ready  # TODO: figure out how to configure from/to which repository or organization (`--repo Mellanox/network-operator`)...
+          --dry-run --body "$PR_MESSAGE_FOR_BOTH_JOBS"  # TODO: remove dry-run when ready  # TODO: figure out how to configure from/to which repository or organization (`--repo Mellanox/network-operator`)...

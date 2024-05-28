@@ -17,20 +17,18 @@ jobs:
       id: lookup-most-recent-release-branch
       run: |
         git fetch --all
-        # most_recent_release_branch=$(git branch --remotes --sort refname | grep network-operator- | tail -n 1 | cut -d "/" -f 2-)
-        # echo MOST_RECENT_RELEASE_BRANCH=$most_recent_release_branch >> $GITHUB_ENV
         echo most_recent_release_branch=$(git branch --remotes --sort refname | grep network-operator- | tail -n 1 | cut -d "/" -f 2-) >> $GITHUB_OUTPUT
     - uses: tgymnich/fork-sync@v1.8
       with:
         owner: k8snetworkplumbingwg  # upstream
         head: master                 # upstream
-        base: ${{ steps.lookup-most-recent-release-branch.outputs.most_recent_release_branch }}  # downstream  # TODO: test substitution with most recent release branch
-        pr_title: "task: Sync from upstream"
-        pr_message: "Created by [$GITHUB_REPOSITORY CI]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) ($GITHUB_JOB job), after syncing the fork from upstream."  # TODO: test link
+        base: ${{ steps.lookup-most-recent-release-branch.outputs.most_recent_release_branch }}  # downstream
+        pr_title: 'task: Sync from upstream'
+        pr_message: 'Created by [$GITHUB_REPOSITORY CI]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) ($GITHUB_JOB job), after syncing the fork from upstream.'  # TODO: test link
     outputs:
       most_recent_release_branch: ${{ steps.lookup-most-recent-release-branch.outputs.most_recent_release_branch }}
 
-  create-pr-to-update-network-operator-values:
+  update-network-operator-values:
     runs-on: ubuntu-latest
     needs: sync-fork
     env:
@@ -38,9 +36,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        repository: mellanox/sriov-network-operator
+        repository: mellanox/network-operator
+        sparse-checkout-cone-mode: false  # TODO: check if this is needed
         sparse-checkout: deployment/network-operator/values.yaml
-        # sparse-checkout-cone-mode: false  # TODO: check if this is needed
     - name: Update image tags in network-operator values
       run: |
         ls -lah  # debug
@@ -59,5 +57,5 @@ jobs:
         gh pr create --dry-run \
           -B ${{ env.DEFAULT_BRANCH }} \
           -H branch_to_merge \
-          --title "task: Update SR-IOV image tags to $MOST_RECENT_RELEASE_BRANCH in chart values" \
-          --body  "Created by [$GITHUB_REPOSITORY CI]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) ($GITHUB_JOB job), after syncing the fork from upstream."  # TODO: test link  # TODO: remove dry-run when ready
+          --title 'task: Update SR-IOV image tags to $MOST_RECENT_RELEASE_BRANCH in chart values' \
+          --body  'Created by [$GITHUB_REPOSITORY CI]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) ($GITHUB_JOB job), after syncing the fork from upstream.'  # TODO: test link  # TODO: remove dry-run when ready

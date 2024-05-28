@@ -54,8 +54,8 @@ jobs:
         git checkout -b feature/update-sriov-to-${MOST_RECENT_RELEASE_BRANCH:17}-${{ github.run_id }}  # TODO: remove run id suffix before merging
         sed -Ei "s/:network-operator-.+/:$MOST_RECENT_RELEASE_BRANCH/g" deployment/network-operator/values.yaml
         git commit -am "task: update SR-IOV images tags to ${MOST_RECENT_RELEASE_BRANCH:17} in chart values"
-        git diff HEAD~1
-        git push
+        git diff HEAD~1 --unified=0
+        git push --set-upstream origin
     - name: Create pull request  # TODO: run idempotently or conditionally if diff
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # TODO: add to repo settings

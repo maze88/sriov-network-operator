@@ -38,7 +38,7 @@ jobs:
         owner: k8snetworkplumbingwg  # upstream
         head: master                 # upstream
         base: ${{ matrix.branch }}   # downstream
-        pr_title: "task: Sync from upstream"
+        pr_title: "task: Sync ${{ matrix.branch }} from upstream"
         pr_message: "${{ env.PR_MESSAGE_BODY_FOR_BOTH_JOBS }}"
         ignore_fail: true  # TODO: add a condition to this step, in order to avoid the 4 minute wait when *no changes in upstream*
       timeout-minutes: 1       # TODO: remove this before merging, in order to maintain informative output message
@@ -46,7 +46,9 @@ jobs:
 
   update-network-operator-values:  # TODO: ask ivan: consider doing this only if the CI (build) passes, and not as early as...here!
     runs-on: ubuntu-latest
-    needs: sync-fork
+    needs:
+    - lookup-most-recent-release-branch
+    - sync-fork
     env:
       MOST_RECENT_RELEASE_BRANCH: ${{ needs.lookup-most-recent-release-branch.outputs.most_recent_release_branch }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # TODO: may need to add to repo settings

@@ -27,10 +27,10 @@ jobs:
       with:
         owner: k8snetworkplumbingwg  # upstream
         head: master                 # upstream
-        base: ${{ env.most_recent_release_branch }}  # downstream  # TODO: ask ivan: check if we should also keep master synced, since we branch out from it...
+        base: ${{ env.most_recent_release_branch }}  # downstream  # TODO: also sync master
         pr_title: "task: Sync from upstream"
         pr_message: "${{ env.PR_MESSAGE_FOR_BOTH_JOBS }}"
-        ignore_fail: true  # TODO: add a condition to this step, in order to avoid the 4 minute wait when no changes detected in upstream
+        ignore_fail: true  # TODO: add a condition to this step, in order to avoid the 4 minute wait when *no changes in upstream*
       timeout-minutes: 1       # TODO: remove this before merging, in order to maintain informative output message
       continue-on-error: true  # TODO: remove this before merging, in order to maintain informative output message
     outputs:
@@ -54,14 +54,15 @@ jobs:
         git checkout -b feature/update-sriov-to-${MOST_RECENT_RELEASE_BRANCH:17}-${{ github.run_id }}  # TODO: remove run id suffix before merging
         sed -Ei "s/:network-operator-.+/:$MOST_RECENT_RELEASE_BRANCH/g" deployment/network-operator/values.yaml
         git commit -am "task: update SR-IOV images tags to ${MOST_RECENT_RELEASE_BRANCH:17} in chart values"
-        # git push
+        git diff HEAD~1
+        git push
     - name: Create pull request  # TODO: run idempotently or conditionally if diff
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # TODO: add to repo settings
       run: |
+        # --head feature/update-sriov-to-${MOST_RECENT_RELEASE_BRANCH:17}-${{ github.run_id }} \
         gh pr create \
-          --head feature/update-sriov-to-${MOST_RECENT_RELEASE_BRANCH:17}-${{ github.run_id }} \
-          --repo maze88/network-operator \
+          --repo Mellanox/network-operator \
           --base master \
           --fill \
-          --dry-run --body "$PR_MESSAGE_FOR_BOTH_JOBS"  # TODO: remove dry-run when ready  # TODO: change org to Mellanox before merging
+          --dry-run --body "$PR_MESSAGE_FOR_BOTH_JOBS"  # TODO: remove dry-run when ready

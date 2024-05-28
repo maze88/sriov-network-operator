@@ -55,7 +55,7 @@ jobs:
         sed -Ei "s/:network-operator-.+/:$MOST_RECENT_RELEASE_BRANCH/g" deployment/network-operator/values.yaml
         git commit -am "task: update SR-IOV images tags to ${MOST_RECENT_RELEASE_BRANCH:17} in chart values"
         git diff HEAD~1 --unified=0
-        git push --set-upstream origin
+        git push --set-upstream origin $(git branch --show-current)
     - name: Create pull request  # TODO: run idempotently or conditionally if diff
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # TODO: add to repo settings

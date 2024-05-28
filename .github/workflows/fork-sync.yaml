@@ -56,12 +56,12 @@ jobs:
         sed -Ei "s/:network-operator-.+/:$MOST_RECENT_RELEASE_BRANCH/g" deployment/network-operator/values.yaml
         git commit -am "task: update SR-IOV images tags to ${MOST_RECENT_RELEASE_BRANCH:17} in chart values"
         git diff HEAD~1 --unified=0
-        git push --set-upstream origin $(git branch --show-current)
+        # git push --set-upstream origin $(git branch --show-current)
     - name: Create pull request  # TODO: run idempotently or conditionally if diff
       run: |
-        # --head $(git branch --show-current) \
         gh pr create \
           --repo Mellanox/network-operator \
           --base master \
+          --head $(git branch --show-current) \
           --fill \
           --dry-run --body "$PR_MESSAGE_FOR_BOTH_JOBS"  # TODO: remove dry-run when ready

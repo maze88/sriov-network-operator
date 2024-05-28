@@ -2,7 +2,7 @@ name: Sync Fork
 
 on:
   schedule:
-  - cron: '0 0 * * *'  # nightly
+  - cron: "0 0 * * *"  # nightly
   workflow_dispatch:   # enable manual trigger
 
 env:
@@ -23,9 +23,11 @@ jobs:
         owner: k8snetworkplumbingwg  # upstream
         head: master                 # upstream
         base: ${{ steps.lookup-most-recent-release-branch.outputs.most_recent_release_branch }}  # downstream
-        pr_title: 'task: Sync from upstream'
-        pr_message: 'Created by [$GITHUB_REPOSITORY CI]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) ($GITHUB_JOB job), after syncing the fork from upstream.'  # TODO: test link
-        ignore_fail: true
+        pr_title: "task: Sync from upstream"
+        pr_message: "Created by [$GITHUB_REPOSITORY CI]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) ($GITHUB_JOB job), after syncing the fork from upstream."  # TODO: test link
+        # ignore_fail: true  # TODO: add a condition to this step, in order to avoid the 4 minute wait when no changes detected in upstream
+      timeout-minutes: 1
+      continue-on-error: true
     outputs:
       most_recent_release_branch: ${{ steps.lookup-most-recent-release-branch.outputs.most_recent_release_branch }}
 
@@ -37,18 +39,15 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        repository: mellanox/network-operator
-        sparse-checkout-cone-mode: false  # TODO: check if this is needed
+        repository: maze88/network-operator  # TODO: change org to Mellanox before merging
+        sparse-checkout-cone-mode: false
         sparse-checkout: deployment/network-operator/values.yaml
     - name: Update image tags in network-operator values
       run: |
-        ls -lah  # debug
-        env | grep MOST_RECENT_RELEASE_BRANCH  # TODO: validate branch name from previous job propagated
-        git checkout -b feature/update-sriov-version-$GITHUB_RUN_ID
-        sed -E "s/:network-operator-.+/:$MOST_RECENT_RELEASE_BRANCH/g" deployment/network-operator/values.yaml  # approach 1
-        yq ".sriov-network-operator.images" deployment/network-operator/values.yaml | sed -E "s/:network-operator-.+/:$MOST_RECENT_RELEASE_BRANCH/g"
-        # sed "s///" deployment/network-operator/values.yam  # TODO: add -i
-        # git commit -am "..."
+        git checkout -b feature/update-sriov-to-${MOST_RECENT_RELEASE_BRANCH:17}-$GITHUB_RUN_ID  # TODO: remove run id suffix before merging
+        sed -Ei "s/:network-operator-.+/:$MOST_RECENT_RELEASE_BRANCH/g" deployment/network-operator/values.yaml
+        git commit -am "task: update SR-IOV images' tags to ${MOST_RECENT_RELEASE_BRANCH:17} in chart values"
+        git log -n 3  # debug
         # git push
     - name: Create pull request  # TODO: only needed if diff
       env:

@@ -60,6 +60,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # TODO: add to repo settings
       run: |
         gh pr create \
+          --head feature/update-sriov-to-${MOST_RECENT_RELEASE_BRANCH:17}-${{ github.run_id }} \
           --repo maze88/network-operator \
           --base master \
           --fill \

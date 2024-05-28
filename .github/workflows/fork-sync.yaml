@@ -41,6 +41,7 @@ jobs:
     needs: sync-fork
     env:
       MOST_RECENT_RELEASE_BRANCH: ${{ needs.sync-fork.outputs.most_recent_release_branch }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # TODO: may need to add to repo settings
     steps:
     - uses: actions/checkout@v4
       with:
@@ -57,10 +58,8 @@ jobs:
         git diff HEAD~1 --unified=0
         git push --set-upstream origin $(git branch --show-current)
     - name: Create pull request  # TODO: run idempotently or conditionally if diff
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # TODO: add to repo settings
       run: |
-        # --head feature/update-sriov-to-${MOST_RECENT_RELEASE_BRANCH:17}-${{ github.run_id }} \
+        # --head $(git branch --show-current) \
         gh pr create \
           --repo Mellanox/network-operator \
           --base master \

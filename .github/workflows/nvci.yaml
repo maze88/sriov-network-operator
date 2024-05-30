@@ -6,7 +6,6 @@ on:
     - feature/ci
 
 env:
-  PR_MESSAGE_BODY_FOR_BOTH_JOBS: "Created by [${{ github.repository }} CI](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (*${{ github.job }}* job), after syncing fork from upstream."  # must be generic/dynamic enough to suit both jobs  # TODO: test link
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # TODO: may need to add to repo settings
 
 jobs:
@@ -31,12 +30,16 @@ jobs:
         git checkout -b feature/update-sriov-to-${MOST_RECENT_RELEASE_BRANCH:17}
         sed -Ei "s/:network-operator-.+/:$MOST_RECENT_RELEASE_BRANCH/g" deployment/network-operator/values.yaml  # TODO: consider using `yq`
         git commit -am "task: update SR-IOV images tags to ${MOST_RECENT_RELEASE_BRANCH:17} in chart values"
-        git diff HEAD~1 --unified=0
-    - name: Create pull request  # TODO: run idempotently or conditionally if no diff
+        set +e
+        git diff HEAD~1 --unified=0 --exit-code
+        echo DIFF_EXIT_CODE=$? >> $GITHUB_ENV
+        set -e
+    - name: Create pull request to network-operator
+      if: ${{ env.DIFF_EXIT_CODE != 0 }}
       run: |
         gh pr create \
           --repo Mellanox/network-operator \
           --base master \
           --head $(git branch --show-current) \
-          --fill \
-          --dry-run --body "$PR_MESSAGE_BODY_FOR_BOTH_JOBS"  # TODO: remove dry-run when ready
+          --dry-run --fill \
+          --body "Created by [${{ github.repository }} CI](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (*${{ github.job }}* job), after syncing fork from upstream."  # TODO: remove dry-run when ready

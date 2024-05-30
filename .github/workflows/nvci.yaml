@@ -1,4 +1,4 @@
-name: TBD
+name: Update SR-IOV version in Network Operator values
 
 on:
   push:  # TODO: remove after development
@@ -30,7 +30,7 @@ jobs:
         git checkout -b feature/update-sriov-to-${MOST_RECENT_RELEASE_BRANCH:17}
         sed -Ei "s/:network-operator-.+/:$MOST_RECENT_RELEASE_BRANCH/g" deployment/network-operator/values.yaml  # TODO: consider using `yq`
         git commit -am "task: update SR-IOV images tags to ${MOST_RECENT_RELEASE_BRANCH:17} in chart values"
-        git diff HEAD~1 --unified=0 --exit-code || \
+        git diff HEAD~1 --color --unified=0 --exit-code || \
           gh pr create \
             --repo Mellanox/network-operator \
             --base master \

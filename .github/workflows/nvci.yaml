@@ -23,23 +23,17 @@ jobs:
         repository: maze88/network-operator  # TODO: change org to Mellanox before merging
         sparse-checkout-cone-mode: false
         sparse-checkout: deployment/network-operator/values.yaml
-    - name: Update image tags in network-operator values
+    - name: Update image tags in network-operator values and create PR
       run: |
         git config user.name  svc-cloud-orch-ci
         git config user.email svc-cloud-orch-ci@nvidia.com
         git checkout -b feature/update-sriov-to-${MOST_RECENT_RELEASE_BRANCH:17}
         sed -Ei "s/:network-operator-.+/:$MOST_RECENT_RELEASE_BRANCH/g" deployment/network-operator/values.yaml  # TODO: consider using `yq`
         git commit -am "task: update SR-IOV images tags to ${MOST_RECENT_RELEASE_BRANCH:17} in chart values"
-        set +e
-        git diff HEAD~1 --unified=0 --exit-code
-        echo DIFF_EXIT_CODE=$? >> $GITHUB_ENV
-        set -e
-    - name: Create pull request to network-operator
-      if: ${{ env.DIFF_EXIT_CODE != 0 }}
-      run: |
-        gh pr create \
-          --repo Mellanox/network-operator \
-          --base master \
-          --head $(git branch --show-current) \
-          --dry-run --fill \
-          --body "Created by [${{ github.repository }} CI](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (*${{ github.job }}* job), after syncing fork from upstream."  # TODO: remove dry-run when ready
+        git diff HEAD~1 --unified=0 --exit-code || \
+          gh pr create \
+            --repo Mellanox/network-operator \
+            --base master \
+            --head $(git branch --show-current) \
+            --dry-run --fill \
+            --body "Created by [${{ github.repository }} CI](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (*${{ github.job }}* job), after syncing fork from upstream."  # TODO: remove dry-run when ready

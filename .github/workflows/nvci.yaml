@@ -1,0 +1,42 @@
+name: TBD
+
+on:
+  push:  # TODO: remove after development
+    branches:
+    - feature/ci
+
+env:
+  PR_MESSAGE_BODY_FOR_BOTH_JOBS: "Created by [${{ github.repository }} CI](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (*${{ github.job }}* job), after syncing fork from upstream."  # must be generic/dynamic enough to suit both jobs  # TODO: test link
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # TODO: may need to add to repo settings
+
+jobs:
+  update-network-operator-values:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Lookup most recent release branch
+      id: lookup-most-recent-release-branch
+      run: |
+        git fetch --all
+        echo MOST_RECENT_RELEASE_BRANCH=$(git branch --remotes --sort refname | grep network-operator- | tail -n 1 | cut -d "/" -f 2-) >> $GITHUB_ENV
+    - uses: actions/checkout@v4  # TODO: make sure having consequtive checkout actions doesn't jumble git workspace
+      with:
+        repository: maze88/network-operator  # TODO: change org to Mellanox before merging
+        sparse-checkout-cone-mode: false
+        sparse-checkout: deployment/network-operator/values.yaml
+    - name: Update image tags in network-operator values
+      run: |
+        git config user.name  svc-cloud-orch-ci
+        git config user.email svc-cloud-orch-ci@nvidia.com
+        git checkout -b feature/update-sriov-to-${MOST_RECENT_RELEASE_BRANCH:17}
+        sed -Ei "s/:network-operator-.+/:$MOST_RECENT_RELEASE_BRANCH/g" deployment/network-operator/values.yaml  # TODO: consider using `yq`
+        git commit -am "task: update SR-IOV images tags to ${MOST_RECENT_RELEASE_BRANCH:17} in chart values"
+        git diff HEAD~1 --unified=0
+    - name: Create pull request  # TODO: run idempotently or conditionally if no diff
+      run: |
+        gh pr create \
+          --repo Mellanox/network-operator \
+          --base master \
+          --head $(git branch --show-current) \
+          --fill \
+          --dry-run --body "$PR_MESSAGE_BODY_FOR_BOTH_JOBS"  # TODO: remove dry-run when ready

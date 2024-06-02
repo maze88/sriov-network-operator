@@ -4,6 +4,9 @@ on:
   schedule:
   - cron: '0 0 * * *'  # nightly
   workflow_dispatch:   # enable manual trigger
+  push:  # TODO: remove after testing
+    branches:
+    - feature/fork-sync
 
 jobs:
   lookup-most-recent-release-branch:
@@ -27,13 +30,22 @@ jobs:
         - master
         - ${{ needs.lookup-most-recent-release-branch.outputs.most_recent_release_branch }}  # if no release branch, this will fail silently
     steps:
+    - name: Check if upstream has progressed
+      run: |
+        git remote add upstream https://github.com/k8snetworkplumbingwg/sriov-network-operator.git
+        git fetch upstream master
+        set +e
+        git diff upstream/master --quiet --exit-code
+        echo GIT_DIFF_EXIT_CODE=$? >> $GITHUB_ENV
+        set -e
     - uses: tgymnich/fork-sync@v1.8
+      if: ${{ env.GIT_DIFF_EXIT_CODE != 0 }}
       with:
         owner: k8snetworkplumbingwg  # upstream
         head: master                 # upstream
         base: ${{ matrix.branch }}   # downstream
         pr_title: 'task: Sync ${{ matrix.branch }} from upstream'
         pr_message: 'Created by [${{ github.repository }} CI](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (*${{ github.job }}* job).'
-        retries: 2
-        retry_after: 10
+        retries: 1
+        retry_after: 5
         ignore_fail: true

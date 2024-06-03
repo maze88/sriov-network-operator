@@ -1,9 +1,8 @@
 name: SR-IOV Network Operator Docker CI
 
 env:
-  BUILD_PLATFORMS: linux/amd64,linux/arm64,linux/ppc64le
   REGISTRY: nvcr.io/nvstaging/mellanox
-  IMAGE_BASE_NAME: ${{ github.repository }}-mzeevi-test  # TODO: remove suffix after developing
+  BUILD_PLATFORMS: linux/amd64,linux/arm64,linux/ppc64le
 
 on:
   push:
@@ -20,13 +19,13 @@ jobs:
       matrix:
         include:  # TODO: see runtime output readability and consider ommiting redundant component field
         - component: controller
-          image_name: ${{ env.IMAGE_BASE_NAME }}
+          image_name: ${{ github.repository }}
           dockerfile: Dockerfile
         - component: config-daemon
-          image_name: ${{ env.IMAGE_BASE_NAME }}-config-daemon
+          image_name: ${{ github.repository }}-config-daemon
           dockerfile: Dockerfile.sriov-network-config-daemon
         - component: webhook
-          image_name: ${{ env.IMAGE_BASE_NAME }}-webhook
+          image_name: ${{ github.repository }}-webhook
           dockerfile: Dockerfile.webhook
     steps:
     - uses: actions/checkout@v3
@@ -48,5 +47,5 @@ jobs:
         platforms: ${{ env.BUILD_PLATFORMS }}
         context: .
         file: ${{ matrix.dockerfile }}
-        tags: ${{ env.REGISTRY }}/${{ matrix.image_name }}:${{ env.DOCKER_TAG }}
+        tags: ${{ env.REGISTRY }}/${{ matrix.image_name }}-mzeevi-test:${{ env.DOCKER_TAG }}  # TODO: remove suffix '-mzeevi-test' after developing
         # push: true  # TODO: uncomment after development

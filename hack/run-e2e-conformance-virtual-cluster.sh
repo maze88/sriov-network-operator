@@ -320,6 +320,10 @@ if [[ -v LOCAL_NETWORK_RESOURCES_INJECTOR_IMAGE ]]; then
   podman_tag_and_push ${LOCAL_NETWORK_RESOURCES_INJECTOR_IMAGE} ${NETWORK_RESOURCES_INJECTOR_IMAGE}
 fi
 
+if [[ -v LOCAL_SRIOV_NETWORK_METRICS_EXPORTER_IMAGE ]]; then
+  export METRICS_EXPORTER_IMAGE="$controller_ip:5000/sriov-network-metrics-exporter:latest"
+  podman_tag_and_push ${LOCAL_SRIOV_NETWORK_METRICS_EXPORTER_IMAGE} ${METRICS_EXPORTER_IMAGE}
+fi
 
 # remove the crio bridge and let flannel to recreate
 kcli ssh $cluster_name-ctlplane-0 << EOF
@@ -361,6 +365,8 @@ do
 done
 
 
+source hack/env.sh
+
 export ADMISSION_CONTROLLERS_ENABLED=true
 export ADMISSION_CONTROLLERS_CERTIFICATES_CERT_MANAGER_ENABLED=true
 export SKIP_VAR_SET=""
@@ -368,12 +374,26 @@ export NAMESPACE="sriov-network-operator"
 export OPERATOR_NAMESPACE="sriov-network-operator"
 export CNI_BIN_PATH=/opt/cni/bin
 export OPERATOR_EXEC=kubectl
-export CLUSTER_TYPE=kubernetes
-export DEV_MODE=TRUE
 export CLUSTER_HAS_EMULATED_PF=TRUE
 
-echo "## deploy namespace"
-envsubst< $root/deploy/namespace.yaml | ${OPERATOR_EXEC} apply -f -
+
+HELM_VALUES_OPTS="\
+  --set images.operator=${SRIOV_NETWORK_OPERATOR_IMAGE} \
+  --set images.sriovConfigDaemon=${SRIOV_NETWORK_CONFIG_DAEMON_IMAGE} \
+  --set images.sriovCni=${SRIOV_CNI_IMAGE} \
+  --set images.sriovDevicePlugin=${SRIOV_DEVICE_PLUGIN_IMAGE} \
+  --set images.resourcesInjector=${NETWORK_RESOURCES_INJECTOR_IMAGE} \
+  --set images.webhook=${SRIOV_NETWORK_WEBHOOK_IMAGE} \
+  --set operator.admissionControllers.enabled=${ADMISSION_CONTROLLERS_ENABLED} \
+  --set operator.admissionControllers.certificates.certManager.enabled=${ADMISSION_CONTROLLERS_CERTIFICATES_CERT_MANAGER_ENABLED} \
+  --set sriovOperatorConfig.deploy=true"
+
+PATH=$PATH:${root}/bin
+make helm
+helm  install -n ${NAMESPACE} --create-namespace \
+  $HELM_VALUES_OPTS \
+  --wait sriov-network-operator ./deployment/sriov-network-operator-chart
+
 
 echo "## create certificates for webhook"
 cat <<EOF | kubectl apply -f -
@@ -415,14 +435,30 @@ spec:
     kind: Issuer
     name: selfsigned-issuer
   secretName: operator-webhook-cert
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: metrics-exporter-cert
+  namespace: ${NAMESPACE}
+spec:
+  commonName: sriov-network-metrics-exporter-service.svc
+  dnsNames:
+  - sriov-network-metrics-exporter-service.${NAMESPACE}.svc.cluster.local
+  - sriov-network-metrics-exporter-service.${NAMESPACE}.svc
+  issuerRef:
+    kind: Issuer
+    name: selfsigned-issuer
+  secretName: metrics-exporter-cert
 EOF
 
 
-echo "## apply CRDs"
-kubectl apply -k $root/config/crd
-
-echo "## deploying SRIOV Network Operator"
-hack/deploy-setup.sh $NAMESPACE
+function cluster_info {
+  if [[ -v TEST_REPORT_PATH ]]; then
+    kubectl cluster-info dump --namespaces ${NAMESPACE},${MULTUS_NAMESPACE} --output-directory "${root}/${TEST_REPORT_PATH}/cluster-info"
+  fi
+}
+trap cluster_info ERR
 
 echo "## wait for sriov operator to be ready"
 hack/deploy-wait.sh
@@ -434,17 +470,5 @@ if [ -z $SKIP_TEST ]; then
     export JUNIT_OUTPUT="${root}/${TEST_REPORT_PATH}/conformance-test-report"
   fi
 
-  # Disable exit on error temporarily to gather cluster information
-  set +e
   SUITE=./test/conformance hack/run-e2e-conformance.sh
-  TEST_EXITE_CODE=$?
-  set -e
-
-  if [[ -v TEST_REPORT_PATH ]]; then
-    kubectl cluster-info dump --namespaces ${NAMESPACE},${MULTUS_NAMESPACE} --output-directory "${root}/${TEST_REPORT_PATH}/cluster-info"
-  fi
-
-  if [[ $TEST_EXITE_CODE -ne 0 ]]; then
-    exit $TEST_EXITE_CODE
-  fi
 fi

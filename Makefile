@@ -107,8 +107,13 @@ uninstall: manifests kustomize
 # Generate manifests e.g. CRD, RBAC etc.
 manifests: controller-gen
 	$(CONTROLLER_GEN) $(CRD_OPTIONS) webhook paths="./..." output:crd:artifacts:config=$(CRD_BASES)
-	cp ./config/crd/bases/* ./deployment/sriov-network-operator/crds/
+	cp ./config/crd/bases/* ./deployment/sriov-network-operator-chart/crds/
 
+check-manifests: manifests
+	@set +e; git diff --quiet config; \
+	if [ $$? -eq 1 ]; \
+	then echo -e "\n`config` folder is out of date. Please run `make manifests` and commit your changes"; \
+	exit 1; fi
 
 sync-manifests-%: manifests
 	@mkdir -p manifests/$*
@@ -171,6 +176,12 @@ skopeo:
 
 fakechroot:
 	if ! which fakechroot; then if [ -f /etc/redhat-release ]; then dnf -y install fakechroot; elif [ -f /etc/lsb-release ]; then sudo apt-get -y update; sudo apt-get -y install fakechroot; fi; fi
+
+$(BIN_DIR)/helm helm:
+	mkdir -p $(BIN_DIR)
+	curl -fsSL -o $(BIN_DIR)/get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+	chmod 700 $(BIN_DIR)/get_helm.sh
+	HELM_INSTALL_DIR=$(BIN_DIR) $(BIN_DIR)/get_helm.sh
 
 deploy-setup: export ADMISSION_CONTROLLERS_ENABLED?=false
 deploy-setup: skopeo install
@@ -253,3 +264,19 @@ $(GOLANGCI_LINT): ; $(info installing golangci-lint...)
 .PHONY: lint
 lint: | $(GOLANGCI_LINT) ; $(info  running golangci-lint...) @ ## Run golangci-lint
 	$(GOLANGCI_LINT) run --timeout=10m
+
+$(BIN_DIR):
+	@mkdir -p $(BIN_DIR)
+
+YQ=$(BIN_DIR)/yq
+YQ_VERSION=v4.44.1
+$(YQ): | $(BIN_DIR); $(info installing yq)
+	@curl -fsSL -o $(YQ) https://github.com/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_linux_amd64 && chmod +x $(YQ)
+
+.PHONY: chart-prepare-release
+chart-prepare-release: | $(YQ) ; ## prepare chart for release
+	@GITHUB_TAG=$(GITHUB_TAG) GITHUB_TOKEN=$(GITHUB_TOKEN) GITHUB_REPO_OWNER=$(GITHUB_REPO_OWNER) hack/release/chart-update.sh
+
+.PHONY: chart-push-release
+chart-push-release: ## push release chart
+	@GITHUB_TAG=$(GITHUB_TAG) GITHUB_TOKEN=$(GITHUB_TOKEN) GITHUB_REPO_OWNER=$(GITHUB_REPO_OWNER) hack/release/chart-push.sh

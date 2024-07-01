@@ -257,7 +257,7 @@ func GetEswitchModeFromStatus(ifaceStatus *InterfaceExt) string {
 func NeedToUpdateSriov(ifaceSpec *Interface, ifaceStatus *InterfaceExt) bool {
 	if ifaceSpec.Mtu > 0 {
 		mtu := ifaceSpec.Mtu
-		if mtu != ifaceStatus.Mtu {
+		if mtu > ifaceStatus.Mtu {
 			log.V(2).Info("NeedToUpdateSriov(): MTU needs update", "desired", mtu, "current", ifaceStatus.Mtu)
 			return true
 		}
@@ -272,12 +272,16 @@ func NeedToUpdateSriov(ifaceSpec *Interface, ifaceStatus *InterfaceExt) bool {
 		log.V(2).Info("NeedToUpdateSriov(): NumVfs needs update", "desired", ifaceSpec.NumVfs, "current", ifaceStatus.NumVfs)
 		return true
 	}
+
+	if ifaceStatus.LinkAdminState == consts.LinkAdminStateDown {
+		log.V(2).Info("NeedToUpdateSriov(): PF link status needs update", "desired to include", "up", "current", ifaceStatus.LinkAdminState)
+		return true
+	}
+
 	if ifaceSpec.NumVfs > 0 {
 		for _, vfStatus := range ifaceStatus.VFs {
-			ingroup := false
 			for _, groupSpec := range ifaceSpec.VfGroups {
 				if IndexInRange(vfStatus.VfID, groupSpec.VfRange) {
-					ingroup = true
 					if vfStatus.Driver == "" {
 						log.V(2).Info("NeedToUpdateSriov(): Driver needs update - has no driver",
 							"desired", groupSpec.DeviceType)
@@ -301,6 +305,16 @@ func NeedToUpdateSriov(ifaceSpec *Interface, ifaceStatus *InterfaceExt) bool {
 							return true
 						}
 
+						if (strings.EqualFold(ifaceStatus.LinkType, consts.LinkTypeETH) && groupSpec.IsRdma) || strings.EqualFold(ifaceStatus.LinkType, consts.LinkTypeIB) {
+							// We do this check only if a Node GUID is set to ensure that we were able to read the
+							// Node GUID. We intentionally skip empty Node GUID in vfStatus because this may happen
+							// when the VF is allocated to a workload.
+							if vfStatus.GUID == consts.UninitializedNodeGUID {
+								log.V(2).Info("NeedToUpdateSriov(): VF GUID needs update",
+									"vf", vfStatus.VfID, "current", vfStatus.GUID)
+								return true
+							}
+						}
 						// this is needed to be sure the admin mac address is configured as expected
 						if ifaceSpec.ExternallyManaged {
 							log.V(2).Info("NeedToUpdateSriov(): need to update the device as it's externally manage",
@@ -315,12 +329,6 @@ func NeedToUpdateSriov(ifaceSpec *Interface, ifaceStatus *InterfaceExt) bool {
 					}
 					break
 				}
-			}
-			if !ingroup && (StringInArray(vfStatus.Driver, vars.DpdkDrivers) || vfStatus.VdpaType != "") {
-				// need to reset VF if it is not a part of a group and:
-				// a. has DPDK driver loaded
-				// b. has VDPA device
-				return true
 			}
 		}
 	}

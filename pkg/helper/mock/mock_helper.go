@@ -8,7 +8,6 @@ import (
 	reflect "reflect"
 
 	gomock "github.com/golang/mock/gomock"
-	ghw "github.com/jaypipes/ghw"
 	v1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
 	store "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/host/store"
 	types "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/host/types"
@@ -415,6 +414,20 @@ func (mr *MockHostHelpersInterfaceMockRecorder) GetMlxNicFwData(pciAddress inter
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetMlxNicFwData", reflect.TypeOf((*MockHostHelpersInterface)(nil).GetMlxNicFwData), pciAddress)
 }
 
+// GetNetDevLinkAdminState mocks base method.
+func (m *MockHostHelpersInterface) GetNetDevLinkAdminState(ifaceName string) string {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetNetDevLinkAdminState", ifaceName)
+	ret0, _ := ret[0].(string)
+	return ret0
+}
+
+// GetNetDevLinkAdminState indicates an expected call of GetNetDevLinkAdminState.
+func (mr *MockHostHelpersInterfaceMockRecorder) GetNetDevLinkAdminState(ifaceName interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetNetDevLinkAdminState", reflect.TypeOf((*MockHostHelpersInterface)(nil).GetNetDevLinkAdminState), ifaceName)
+}
+
 // GetNetDevLinkSpeed mocks base method.
 func (m *MockHostHelpersInterface) GetNetDevLinkSpeed(name string) string {
 	m.ctrl.T.Helper()
@@ -441,6 +454,20 @@ func (m *MockHostHelpersInterface) GetNetDevMac(name string) string {
 func (mr *MockHostHelpersInterfaceMockRecorder) GetNetDevMac(name interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetNetDevMac", reflect.TypeOf((*MockHostHelpersInterface)(nil).GetNetDevMac), name)
+}
+
+// GetNetDevNodeGUID mocks base method.
+func (m *MockHostHelpersInterface) GetNetDevNodeGUID(pciAddr string) string {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetNetDevNodeGUID", pciAddr)
+	ret0, _ := ret[0].(string)
+	return ret0
+}
+
+// GetNetDevNodeGUID indicates an expected call of GetNetDevNodeGUID.
+func (mr *MockHostHelpersInterfaceMockRecorder) GetNetDevNodeGUID(pciAddr interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetNetDevNodeGUID", reflect.TypeOf((*MockHostHelpersInterface)(nil).GetNetDevNodeGUID), pciAddr)
 }
 
 // GetNetdevMTU mocks base method.
@@ -514,20 +541,6 @@ func (m *MockHostHelpersInterface) GetPhysSwitchID(name string) (string, error) 
 func (mr *MockHostHelpersInterfaceMockRecorder) GetPhysSwitchID(name interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetPhysSwitchID", reflect.TypeOf((*MockHostHelpersInterface)(nil).GetPhysSwitchID), name)
-}
-
-// GetVfInfo mocks base method.
-func (m *MockHostHelpersInterface) GetVfInfo(pciAddr string, devices []*ghw.PCIDevice) v1.VirtualFunction {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetVfInfo", pciAddr, devices)
-	ret0, _ := ret[0].(v1.VirtualFunction)
-	return ret0
-}
-
-// GetVfInfo indicates an expected call of GetVfInfo.
-func (mr *MockHostHelpersInterfaceMockRecorder) GetVfInfo(pciAddr, devices interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetVfInfo", reflect.TypeOf((*MockHostHelpersInterface)(nil).GetVfInfo), pciAddr, devices)
 }
 
 // HasDriver mocks base method.

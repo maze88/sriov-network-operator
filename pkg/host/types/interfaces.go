@@ -1,7 +1,6 @@
 package types
 
 import (
-	"github.com/jaypipes/ghw"
 	"github.com/vishvananda/netlink"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
@@ -94,6 +93,8 @@ type NetworkInterface interface {
 	SetNetdevMTU(pciAddr string, mtu int) error
 	// GetNetDevMac returns the network interface mac address
 	GetNetDevMac(name string) string
+	// GetNetDevNodeGUID returns the network interface node GUID if device is RDMA capable otherwise returns empty string
+	GetNetDevNodeGUID(pciAddr string) string
 	// GetNetDevLinkSpeed returns the network interface link speed
 	GetNetDevLinkSpeed(name string) string
 	// GetDevlinkDeviceParam returns devlink parameter for the device as a string, if the parameter has multiple values
@@ -105,6 +106,8 @@ type NetworkInterface interface {
 	SetDevlinkDeviceParam(pciAddr, paramName, value string) error
 	// EnableHwTcOffload make sure that hw-tc-offload feature is enabled if device supports it
 	EnableHwTcOffload(ifaceName string) error
+	// GetNetDevLinkAdminState returns the admin state of the interface.
+	GetNetDevLinkAdminState(ifaceName string) string
 }
 
 type ServiceInterface interface {
@@ -130,8 +133,6 @@ type SriovInterface interface {
 	// SetSriovNumVfs changes the number of virtual functions allocated for a specific
 	// physical function base on pci address
 	SetSriovNumVfs(pciAddr string, numVfs int) error
-	// GetVfInfo returns the virtual function information is the operator struct from the host information
-	GetVfInfo(pciAddr string, devices []*ghw.PCIDevice) sriovnetworkv1.VirtualFunction
 	// SetVfGUID sets the GUID for a virtual function
 	SetVfGUID(vfAddr string, pfLink netlink.Link) error
 	// VFIsReady returns the interface virtual function if the device is ready

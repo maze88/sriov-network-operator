@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -xeo pipefail
 
-OCP_VERSION=${OCP_VERSION:-4.16.0-rc.2}
+OCP_VERSION=${OCP_VERSION:-4.16.0}
 cluster_name=${CLUSTER_NAME:-ocp-virt}
 domain_name=lab
 
@@ -190,6 +190,9 @@ export CLUSTER_TYPE=openshift
 export DEV_MODE=TRUE
 export CLUSTER_HAS_EMULATED_PF=TRUE
 export OPERATOR_LEADER_ELECTION_ENABLE=true
+export METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED=true
+export METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT=${METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT:-"prometheus-k8s"}
+export METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE=${METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE:-"openshfit-monitoring"}
 
 export SRIOV_NETWORK_OPERATOR_IMAGE="$registry/$NAMESPACE/sriov-network-operator:latest"
 export SRIOV_NETWORK_CONFIG_DAEMON_IMAGE="$registry/$NAMESPACE/sriov-network-config-daemon:latest"
@@ -237,7 +240,11 @@ echo ${auth} > registry-login.conf
 internal_registry="image-registry.openshift-image-registry.svc:5000"
 pass=$( jq .\"image-registry.openshift-image-registry.svc:5000\".auth registry-login.conf  )
 pass=`echo ${pass:1:-1} | base64 -d`
-podman login -u serviceaccount -p ${pass:15} $registry --tls-verify=false
+
+# dockercfg password is in the form `<token>:password`. We need to trim the `<token>:` prefix
+pass=${pass#"<token>:"}
+
+podman login -u serviceaccount -p ${pass} $registry --tls-verify=false
 
 MAX_RETRIES=20
 DELAY_SECONDS=10

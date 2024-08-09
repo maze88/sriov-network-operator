@@ -15,6 +15,8 @@ spec:
     metadata:
       labels:
         name: sriov-network-operator
+      annotations:
+        openshift.io/required-scc: restricted-v2
     spec:
       affinity:
         nodeAffinity:
@@ -58,6 +60,8 @@ spec:
               value: $SRIOV_INFINIBAND_CNI_IMAGE
             - name: OVS_CNI_IMAGE
               value: $OVS_CNI_IMAGE
+            - name: RDMA_CNI_IMAGE
+              value: $RDMA_CNI_IMAGE
             - name: SRIOV_DEVICE_PLUGIN_IMAGE
               value: $SRIOV_DEVICE_PLUGIN_IMAGE
             - name: NETWORK_RESOURCES_INJECTOR_IMAGE
@@ -72,6 +76,12 @@ spec:
               value: $METRICS_EXPORTER_IMAGE
             - name: METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE
               value: $METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE
+            - name: METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED
+              value: "$METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED"
+            - name: METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT
+              value: $METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT
+            - name: METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE
+              value: $METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE
             - name: RESOURCE_PREFIX
               value: $RESOURCE_PREFIX
             - name: DEV_MODE

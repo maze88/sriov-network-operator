@@ -92,6 +92,7 @@ func runServiceCmd(cmd *cobra.Command, args []string) error {
 	}
 	setupLog.V(2).Info("sriov-config-service", "config", sriovConf)
 	vars.DevMode = sriovConf.UnsupportedNics
+	vars.ManageSoftwareBridges = sriovConf.ManageSoftwareBridges
 
 	if err := initSupportedNics(); err != nil {
 		return updateSriovResultErr(setupLog, phaseArg, fmt.Errorf("failed to initialize list of supported NIC ids: %v", err))
@@ -145,9 +146,9 @@ func phasePre(setupLog logr.Logger, conf *systemd.SriovConfig, hostHelpers helpe
 		return fmt.Errorf("failed to remove sriov result file: %v", err)
 	}
 
-	_, err := hostHelpers.TryEnableRdma()
+	_, err := hostHelpers.CheckRDMAEnabled()
 	if err != nil {
-		setupLog.Error(err, "warning, failed to enable RDMA")
+		setupLog.Error(err, "warning, failed to check RDMA state")
 	}
 	hostHelpers.TryEnableTun()
 	hostHelpers.TryEnableVhostNet()

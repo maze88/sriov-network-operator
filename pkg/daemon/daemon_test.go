@@ -18,19 +18,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
-	mock_platforms "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/platforms/mock"
-	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/fakefilesystem"
-
 	snclient "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/client/clientset/versioned"
 	snclientset "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/client/clientset/versioned/fake"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/featuregate"
 	mock_helper "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/helper/mock"
+	mock_platforms "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/platforms/mock"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/platforms/openshift"
 	plugin "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/plugins"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/plugins/fake"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/plugins/generic"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/fakefilesystem"
 )
+
+var SriovDevicePluginPod corev1.Pod
 
 func TestConfigDaemon(t *testing.T) {
 	RegisterFailHandler(Fail)
@@ -107,19 +109,6 @@ var _ = Describe("Config Daemon", func() {
 			},
 		}
 
-		SriovDevicePluginPod := corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "sriov-device-plugin-xxxx",
-				Namespace: vars.Namespace,
-				Labels: map[string]string{
-					"app": "sriov-device-plugin",
-				},
-			},
-			Spec: corev1.PodSpec{
-				NodeName: "test-node",
-			},
-		}
-
 		err = sriovnetworkv1.AddToScheme(scheme.Scheme)
 		Expect(err).ToNot(HaveOccurred())
 		kClient := kclient.NewClientBuilder().WithScheme(scheme.Scheme).WithRuntimeObjects(&corev1.Node{
@@ -130,7 +119,7 @@ var _ = Describe("Config Daemon", func() {
 					Namespace: vars.Namespace,
 				}}).Build()
 
-		kubeClient := fakek8s.NewSimpleClientset(&FakeSupportedNicIDs, &SriovDevicePluginPod)
+		kubeClient := fakek8s.NewSimpleClientset(&FakeSupportedNicIDs)
 		snclient := snclientset.NewSimpleClientset()
 		err = sriovnetworkv1.InitNicIDMapFromConfigMap(kubeClient, vars.Namespace)
 		Expect(err).ToNot(HaveOccurred())
@@ -145,11 +134,13 @@ var _ = Describe("Config Daemon", func() {
 		platformHelper.EXPECT().IsHypershift().Return(false).AnyTimes()
 
 		vendorHelper := mock_helper.NewMockHostHelpersInterface(mockCtrl)
-		vendorHelper.EXPECT().TryEnableRdma().Return(true, nil).AnyTimes()
+		vendorHelper.EXPECT().CheckRDMAEnabled().Return(true, nil).AnyTimes()
 		vendorHelper.EXPECT().TryEnableVhostNet().AnyTimes()
 		vendorHelper.EXPECT().TryEnableTun().AnyTimes()
 		vendorHelper.EXPECT().PrepareNMUdevRule([]string{"0x1014", "0x154c"}).Return(nil).AnyTimes()
 		vendorHelper.EXPECT().PrepareVFRepUdevRule().Return(nil).AnyTimes()
+
+		featureGates := featuregate.New()
 
 		sut = New(
 			kClient,
@@ -162,6 +153,7 @@ var _ = Describe("Config Daemon", func() {
 			syncCh,
 			refreshCh,
 			er,
+			featureGates,
 			nil,
 		)
 
@@ -172,6 +164,22 @@ var _ = Describe("Config Daemon", func() {
 			err := sut.Run(stopCh, exitCh)
 			Expect(err).ToNot(HaveOccurred())
 		}()
+
+		SriovDevicePluginPod = corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "sriov-device-plugin-xxxx",
+				Namespace: vars.Namespace,
+				Labels: map[string]string{
+					"app": "sriov-device-plugin",
+				},
+			},
+			Spec: corev1.PodSpec{
+				NodeName: "test-node",
+			},
+		}
+		_, err = sut.kubeClient.CoreV1().Pods(vars.Namespace).Create(context.Background(), &SriovDevicePluginPod, metav1.CreateOptions{})
+		Expect(err).ToNot(HaveOccurred())
+
 	})
 
 	AfterEach(func() {
@@ -282,6 +290,34 @@ var _ = Describe("Config Daemon", func() {
 			Expect(msg.syncStatus).To(Equal("Succeeded"))
 
 			Expect(sut.desiredNodeState.GetGeneration()).To(BeNumerically("==", 777))
+		})
+
+		It("restart all the sriov-device-plugin pods present on the node", func() {
+			otherPod1 := SriovDevicePluginPod.DeepCopy()
+			otherPod1.Name = "sriov-device-plugin-xxxa"
+			_, err := sut.kubeClient.CoreV1().Pods(vars.Namespace).Create(context.Background(), otherPod1, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			otherPod2 := SriovDevicePluginPod.DeepCopy()
+			otherPod2.Name = "sriov-device-plugin-xxxz"
+			_, err = sut.kubeClient.CoreV1().Pods(vars.Namespace).Create(context.Background(), otherPod2, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred())
+
+			err = sut.restartDevicePluginPod()
+			Expect(err).ToNot(HaveOccurred())
+
+			Eventually(func() (int, error) {
+				podList, err := sut.kubeClient.CoreV1().Pods(vars.Namespace).List(context.Background(), metav1.ListOptions{
+					LabelSelector: "app=sriov-device-plugin",
+					FieldSelector: "spec.nodeName=test-node",
+				})
+
+				if err != nil {
+					return 0, err
+				}
+
+				return len(podList.Items), nil
+			}, "1s").Should(BeZero())
 		})
 	})
 })

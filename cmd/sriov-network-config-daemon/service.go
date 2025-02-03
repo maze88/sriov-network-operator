@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
@@ -40,6 +41,12 @@ import (
 const (
 	PhasePre  = "pre"
 	PhasePost = "post"
+
+	// InitializationDeviceDiscoveryTimeoutSec constant defines the number of
+	// seconds to wait for devices to be registered in the system with the expected name.
+	InitializationDeviceDiscoveryTimeoutSec = 60
+	// InitializationDeviceUdevProcessingTimeoutSec constant defines the number of seconds to wait for udev rules to process
+	InitializationDeviceUdevProcessingTimeoutSec = 60
 )
 
 var (
@@ -92,6 +99,8 @@ func runServiceCmd(cmd *cobra.Command, args []string) error {
 	}
 	setupLog.V(2).Info("sriov-config-service", "config", sriovConf)
 	vars.DevMode = sriovConf.UnsupportedNics
+	vars.ManageSoftwareBridges = sriovConf.ManageSoftwareBridges
+	vars.OVSDBSocketPath = sriovConf.OVSDBSocketPath
 
 	if err := initSupportedNics(); err != nil {
 		return updateSriovResultErr(setupLog, phaseArg, fmt.Errorf("failed to initialize list of supported NIC ids: %v", err))
@@ -101,6 +110,8 @@ func runServiceCmd(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return updateSriovResultErr(setupLog, phaseArg, fmt.Errorf("failed to create hostHelpers: %v", err))
 	}
+
+	waitForDevicesInitialization(setupLog, sriovConf, hostHelpers)
 
 	if phaseArg == PhasePre {
 		err = phasePre(setupLog, sriovConf, hostHelpers)
@@ -145,9 +156,9 @@ func phasePre(setupLog logr.Logger, conf *systemd.SriovConfig, hostHelpers helpe
 		return fmt.Errorf("failed to remove sriov result file: %v", err)
 	}
 
-	_, err := hostHelpers.TryEnableRdma()
+	_, err := hostHelpers.CheckRDMAEnabled()
 	if err != nil {
-		setupLog.Error(err, "warning, failed to enable RDMA")
+		setupLog.Error(err, "warning, failed to check RDMA state")
 	}
 	hostHelpers.TryEnableTun()
 	hostHelpers.TryEnableVhostNet()
@@ -180,7 +191,7 @@ func callPlugin(setupLog logr.Logger, phase string, conf *systemd.SriovConfig, h
 		return nil
 	}
 
-	nodeState, err := getNetworkNodeState(setupLog, conf, hostHelpers)
+	nodeState, err := getNetworkNodeState(setupLog, conf, phase, hostHelpers)
 	if err != nil {
 		return err
 	}
@@ -206,7 +217,9 @@ func getPlugin(setupLog logr.Logger, phase string,
 	case consts.Baremetal:
 		switch phase {
 		case PhasePre:
-			configPlugin, err = newGenericPluginFunc(hostHelpers, generic.WithSkipVFConfiguration())
+			configPlugin, err = newGenericPluginFunc(hostHelpers,
+				generic.WithSkipVFConfiguration(),
+				generic.WithSkipBridgeConfiguration())
 		case PhasePost:
 			configPlugin, err = newGenericPluginFunc(hostHelpers)
 		}
@@ -228,10 +241,11 @@ func getPlugin(setupLog logr.Logger, phase string,
 	return configPlugin, nil
 }
 
-func getNetworkNodeState(setupLog logr.Logger, conf *systemd.SriovConfig,
+func getNetworkNodeState(setupLog logr.Logger, conf *systemd.SriovConfig, phase string,
 	hostHelpers helper.HostHelpersInterface) (*sriovv1.SriovNetworkNodeState, error) {
 	var (
 		ifaceStatuses []sriovv1.InterfaceExt
+		bridges       sriovv1.Bridges
 		err           error
 	)
 	switch conf.PlatformType {
@@ -239,6 +253,13 @@ func getNetworkNodeState(setupLog logr.Logger, conf *systemd.SriovConfig,
 		ifaceStatuses, err = hostHelpers.DiscoverSriovDevices(hostHelpers)
 		if err != nil {
 			return nil, fmt.Errorf("failed to discover sriov devices on the host:  %v", err)
+		}
+		if phase != PhasePre && vars.ManageSoftwareBridges {
+			// openvswitch is not available during the pre phase
+			bridges, err = hostHelpers.DiscoverBridges()
+			if err != nil {
+				return nil, fmt.Errorf("failed to discover managed bridges on the host:  %v", err)
+			}
 		}
 	case consts.VirtualOpenStack:
 		platformHelper, err := newPlatformHelperFunc()
@@ -256,7 +277,7 @@ func getNetworkNodeState(setupLog logr.Logger, conf *systemd.SriovConfig,
 	}
 	return &sriovv1.SriovNetworkNodeState{
 		Spec:   conf.Spec,
-		Status: sriovv1.SriovNetworkNodeStateStatus{Interfaces: ifaceStatuses},
+		Status: sriovv1.SriovNetworkNodeStateStatus{Interfaces: ifaceStatuses, Bridges: bridges},
 	}, nil
 }
 
@@ -290,4 +311,52 @@ func updateResult(setupLog logr.Logger, result, msg string) error {
 	}
 	setupLog.V(0).Info("result file updated", "SyncStatus", sriovResult.SyncStatus, "LastSyncError", msg)
 	return nil
+}
+
+// waitForDevicesInitialization should be executed in both the pre and post-networking stages.
+// This function ensures that the network devices specified in the configuration are registered
+// and handled by UDEV. Sometimes, the initialization of network devices might take a significant
+// amount of time, and the sriov-config systemd service may start before the devices are fully
+// processed, leading to failure.
+//
+// To address this, we not only check if the devices are registered with the correct name but also
+// wait for the udev event queue to empty. This increases the likelihood that the service will start
+// only when the devices are fully initialized. It is required to call this function in the
+// "post-networking" phase as well because the OS network manager might change device configurations,
+// and we need to ensure these changes are fully processed before starting the post-networking part.
+//
+// The timeouts used in this function are intentionally kept low to avoid blocking the OS loading
+// process for too long in case of any issues.
+//
+// Note: Currently, this function handles only Baremetal clusters. We do not have evidence that
+// this logic is required for virtual clusters.
+func waitForDevicesInitialization(setupLog logr.Logger, conf *systemd.SriovConfig, hostHelpers helper.HostHelpersInterface) {
+	if conf.PlatformType != consts.Baremetal {
+		// skip waiting on virtual cluster
+		return
+	}
+	// wait for devices from the spec to be registered in the system with expected names
+	devicesToWait := make(map[string]string, len(conf.Spec.Interfaces))
+	for _, d := range conf.Spec.Interfaces {
+		devicesToWait[d.PciAddress] = d.Name
+	}
+	deadline := time.Now().Add(time.Second * time.Duration(InitializationDeviceDiscoveryTimeoutSec))
+	for time.Now().Before(deadline) {
+		for pciAddr, name := range devicesToWait {
+			if hostHelpers.TryGetInterfaceName(pciAddr) == name {
+				delete(devicesToWait, pciAddr)
+			}
+		}
+		if len(devicesToWait) == 0 {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if len(devicesToWait) != 0 {
+		setupLog.Info("WARNING: some devices were not initialized", "devices", devicesToWait, "timeout", InitializationDeviceDiscoveryTimeoutSec)
+	}
+	if err := hostHelpers.WaitUdevEventsProcessed(InitializationDeviceUdevProcessingTimeoutSec); err != nil {
+		setupLog.Info("WARNING: failed to wait for udev events processing", "reason", err.Error(),
+			"timeout", InitializationDeviceUdevProcessingTimeoutSec)
+	}
 }

@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"os/exec"
+	"reflect"
 	"sync"
 	"time"
 
@@ -23,6 +23,7 @@ import (
 	snclientset "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/client/clientset/versioned"
 	sninformer "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/client/informers/externalversions"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/featuregate"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/helper"
 	snolog "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/log"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/platforms"
@@ -82,6 +83,8 @@ type Daemon struct {
 	workqueue workqueue.RateLimitingInterface
 
 	eventRecorder *EventRecorder
+
+	featureGate featuregate.FeatureGate
 }
 
 func New(
@@ -95,6 +98,7 @@ func New(
 	syncCh <-chan struct{},
 	refreshCh chan<- Message,
 	er *EventRecorder,
+	featureGates featuregate.FeatureGate,
 	disabledPlugins []string,
 ) *Daemon {
 	return &Daemon{
@@ -113,7 +117,9 @@ func New(
 			&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(updateDelay), 1)},
 			workqueue.NewItemExponentialFailureRateLimiter(1*time.Second, maxUpdateBackoff)), "SriovNetworkNodeState"),
 		eventRecorder:   er,
+		featureGate:     featureGates,
 		disabledPlugins: disabledPlugins,
+		mu:              &sync.Mutex{},
 	}
 }
 
@@ -129,7 +135,7 @@ func (dn *Daemon) Run(stopCh <-chan struct{}, exitCh <-chan error) error {
 
 	if !vars.UsingSystemdMode {
 		log.Log.V(0).Info("Run(): daemon running in daemon mode")
-		dn.HostHelpers.TryEnableRdma()
+		dn.HostHelpers.CheckRDMAEnabled()
 		dn.HostHelpers.TryEnableTun()
 		dn.HostHelpers.TryEnableVhostNet()
 		err := systemd.CleanSriovFilesFromHost(vars.ClusterType == consts.ClusterTypeOpenshift)
@@ -153,7 +159,6 @@ func (dn *Daemon) Run(stopCh <-chan struct{}, exitCh <-chan error) error {
 
 	var timeout int64 = 5
 	var metadataKey = "metadata.name"
-	dn.mu = &sync.Mutex{}
 	informerFactory := sninformer.NewFilteredSharedInformerFactory(dn.sriovClient,
 		time.Second*15,
 		vars.Namespace,
@@ -286,6 +291,7 @@ func (dn *Daemon) operatorConfigAddHandler(obj interface{}) {
 }
 
 func (dn *Daemon) operatorConfigChangeHandler(old, new interface{}) {
+	oldCfg := old.(*sriovnetworkv1.SriovOperatorConfig)
 	newCfg := new.(*sriovnetworkv1.SriovOperatorConfig)
 	if newCfg.Namespace != vars.Namespace || newCfg.Name != consts.DefaultConfigName {
 		log.Log.V(2).Info("unsupported SriovOperatorConfig", "namespace", newCfg.Namespace, "name", newCfg.Name)
@@ -299,6 +305,13 @@ func (dn *Daemon) operatorConfigChangeHandler(old, new interface{}) {
 		dn.disableDrain = newDisableDrain
 		log.Log.Info("Set Disable Drain", "value", dn.disableDrain)
 	}
+
+	if !reflect.DeepEqual(oldCfg.Spec.FeatureGates, newCfg.Spec.FeatureGates) {
+		dn.featureGate.Init(newCfg.Spec.FeatureGates)
+		log.Log.Info("Updated featureGates", "featureGates", dn.featureGate.String())
+	}
+
+	vars.MlxPluginFwReset = dn.featureGate.IsEnabled(consts.MellanoxFirmwareResetFeatureGate)
 }
 
 func (dn *Daemon) nodeStateSyncHandler() error {
@@ -669,7 +682,6 @@ func (dn *Daemon) restartDevicePluginPod() error {
 	defer dn.mu.Unlock()
 	log.Log.V(2).Info("restartDevicePluginPod(): try to restart device plugin pod")
 
-	var podToDelete string
 	pods, err := dn.kubeClient.CoreV1().Pods(vars.Namespace).List(context.Background(), metav1.ListOptions{
 		LabelSelector:   "app=sriov-device-plugin",
 		FieldSelector:   "spec.nodeName=" + vars.NodeName,
@@ -688,35 +700,37 @@ func (dn *Daemon) restartDevicePluginPod() error {
 		log.Log.Info("restartDevicePluginPod(): device plugin pod exited")
 		return nil
 	}
-	podToDelete = pods.Items[0].Name
 
-	log.Log.V(2).Info("restartDevicePluginPod(): Found device plugin pod, deleting it", "pod-name", podToDelete)
-	err = dn.kubeClient.CoreV1().Pods(vars.Namespace).Delete(context.Background(), podToDelete, metav1.DeleteOptions{})
-	if errors.IsNotFound(err) {
-		log.Log.Info("restartDevicePluginPod(): pod to delete not found")
-		return nil
-	}
-	if err != nil {
-		log.Log.Error(err, "restartDevicePluginPod(): Failed to delete device plugin pod, retrying")
-		return err
-	}
-
-	if err := wait.PollImmediateUntil(3*time.Second, func() (bool, error) {
-		_, err := dn.kubeClient.CoreV1().Pods(vars.Namespace).Get(context.Background(), podToDelete, metav1.GetOptions{})
+	for _, pod := range pods.Items {
+		podToDelete := pod.Name
+		log.Log.V(2).Info("restartDevicePluginPod(): Found device plugin pod, deleting it", "pod-name", podToDelete)
+		err = dn.kubeClient.CoreV1().Pods(vars.Namespace).Delete(context.Background(), podToDelete, metav1.DeleteOptions{})
 		if errors.IsNotFound(err) {
-			log.Log.Info("restartDevicePluginPod(): device plugin pod exited")
-			return true, nil
+			log.Log.Info("restartDevicePluginPod(): pod to delete not found")
+			continue
+		}
+		if err != nil {
+			log.Log.Error(err, "restartDevicePluginPod(): Failed to delete device plugin pod, retrying")
+			return err
 		}
 
-		if err != nil {
-			log.Log.Error(err, "restartDevicePluginPod(): Failed to check for device plugin exit, retrying")
-		} else {
-			log.Log.Info("restartDevicePluginPod(): waiting for device plugin pod to exit", "pod-name", podToDelete)
+		if err := wait.PollImmediateUntil(3*time.Second, func() (bool, error) {
+			_, err := dn.kubeClient.CoreV1().Pods(vars.Namespace).Get(context.Background(), podToDelete, metav1.GetOptions{})
+			if errors.IsNotFound(err) {
+				log.Log.Info("restartDevicePluginPod(): device plugin pod exited")
+				return true, nil
+			}
+
+			if err != nil {
+				log.Log.Error(err, "restartDevicePluginPod(): Failed to check for device plugin exit, retrying")
+			} else {
+				log.Log.Info("restartDevicePluginPod(): waiting for device plugin pod to exit", "pod-name", podToDelete)
+			}
+			return false, nil
+		}, dn.stopCh); err != nil {
+			log.Log.Error(err, "restartDevicePluginPod(): failed to wait for checking pod deletion")
+			return err
 		}
-		return false, nil
-	}, dn.stopCh); err != nil {
-		log.Log.Error(err, "restartDevicePluginPod(): failed to wait for checking pod deletion")
-		return err
 	}
 
 	return nil
@@ -736,11 +750,11 @@ func (dn *Daemon) rebootNode() {
 	// However note we use `;` instead of `&&` so we keep rebooting even
 	// if kubelet failed to shutdown - that way the machine will still eventually reboot
 	// as systemd will time out the stop invocation.
-	cmd := exec.Command("systemd-run", "--unit", "sriov-network-config-daemon-reboot",
+	stdOut, StdErr, err := dn.HostHelpers.RunCommand("systemd-run", "--unit", "sriov-network-config-daemon-reboot",
 		"--description", "sriov-network-config-daemon reboot node", "/bin/sh", "-c", "systemctl stop kubelet.service; reboot")
 
-	if err := cmd.Run(); err != nil {
-		log.Log.Error(err, "failed to reboot node")
+	if err != nil {
+		log.Log.Error(err, "failed to reboot node", "stdOut", stdOut, "StdErr", StdErr)
 	}
 }
 

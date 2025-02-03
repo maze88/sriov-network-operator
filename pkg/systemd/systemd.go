@@ -43,9 +43,11 @@ const (
 // TODO: move this to the host interface also
 
 type SriovConfig struct {
-	Spec            sriovnetworkv1.SriovNetworkNodeStateSpec `yaml:"spec"`
-	UnsupportedNics bool                                     `yaml:"unsupportedNics"`
-	PlatformType    consts.PlatformTypes                     `yaml:"platformType"`
+	Spec                  sriovnetworkv1.SriovNetworkNodeStateSpec `yaml:"spec"`
+	UnsupportedNics       bool                                     `yaml:"unsupportedNics"`
+	PlatformType          consts.PlatformTypes                     `yaml:"platformType"`
+	ManageSoftwareBridges bool                                     `yaml:"manageSoftwareBridges"`
+	OVSDBSocketPath       string                                   `yaml:"ovsdbSocketPath"`
 }
 
 type SriovResult struct {
@@ -70,6 +72,8 @@ func WriteConfFile(newState *sriovnetworkv1.SriovNetworkNodeState) (bool, error)
 		newState.Spec,
 		vars.DevMode,
 		vars.PlatformType,
+		vars.ManageSoftwareBridges,
+		vars.OVSDBSocketPath,
 	}
 
 	_, err := os.Stat(utils.GetHostExtensionPath(SriovSystemdConfigPath))

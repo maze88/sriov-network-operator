@@ -1,6 +1,6 @@
 module github.com/k8snetworkplumbingwg/sriov-network-operator
 
-go 1.22
+go 1.22.4
 
 require (
 	github.com/Masterminds/sprig/v3 v3.2.2
@@ -9,12 +9,14 @@ require (
 	github.com/coreos/go-systemd/v22 v22.5.0
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/go-logr/logr v1.2.4
+	github.com/go-logr/stdr v1.2.2
 	github.com/golang/mock v1.4.4
 	github.com/google/go-cmp v0.6.0
+	github.com/google/renameio/v2 v2.0.0
 	github.com/google/uuid v1.3.1
 	github.com/hashicorp/go-retryablehttp v0.7.7
-	github.com/jaypipes/ghw v0.9.0
-	github.com/jaypipes/pcidb v1.0.0
+	github.com/jaypipes/ghw v0.13.1-0.20241024164530-c1bfc6e6cd6a
+	github.com/jaypipes/pcidb v1.0.1
 	github.com/k8snetworkplumbingwg/network-attachment-definition-client v1.4.0
 	github.com/k8snetworkplumbingwg/sriov-network-device-plugin v0.0.0-20221127172732-a5a7395122e3
 	github.com/k8snetworkplumbingwg/sriovnet v1.2.0
@@ -24,14 +26,21 @@ require (
 	github.com/openshift/api v0.0.0-20230807132801-600991d550ac
 	github.com/openshift/client-go v0.0.0-20230607134213-3cd0021bbee3
 	github.com/openshift/machine-config-operator v0.0.1-0.20231024085435-7e1fb719c1ba
+	github.com/ovn-org/libovsdb v0.6.1-0.20240125124854-03f787b1a892
 	github.com/pkg/errors v0.9.1
+	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.68.0
+	github.com/prometheus-operator/prometheus-operator/pkg/client v0.68.0
+	github.com/prometheus/client_model v0.5.0
+	github.com/prometheus/common v0.45.0
 	github.com/safchain/ethtool v0.3.0
-	github.com/spf13/cobra v1.7.0
+	github.com/spf13/cobra v1.8.0
 	github.com/stretchr/testify v1.8.4
 	github.com/vishvananda/netlink v1.2.1-beta.2.0.20240221172127-ec7bcb248e94
 	github.com/vishvananda/netns v0.0.4
 	go.uber.org/zap v1.25.0
+	golang.org/x/net v0.33.0
 	golang.org/x/time v0.3.0
+	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.28.3
 	k8s.io/apiextensions-apiserver v0.28.3
@@ -55,6 +64,9 @@ require (
 	github.com/aws/aws-sdk-go v1.44.204 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/blang/semver/v4 v4.0.0 // indirect
+	github.com/cenkalti/backoff/v4 v4.2.1 // indirect
+	github.com/cenkalti/hub v1.0.1 // indirect
+	github.com/cenkalti/rpc2 v0.0.0-20210604223624-c1acbc6ec984 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/chai2010/gettext-go v1.0.2 // indirect
 	github.com/clarketm/json v1.17.1 // indirect
@@ -97,6 +109,8 @@ require (
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/k8snetworkplumbingwg/govdpa v0.1.4 // indirect
+	github.com/kr/pretty v0.3.1 // indirect
+	github.com/kr/text v0.2.0 // indirect
 	github.com/liggitt/tabwriter v0.0.0-20181228230101-89fcab3d43de // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
@@ -114,11 +128,11 @@ require (
 	github.com/peterbourgon/diskv v2.0.1+incompatible // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/prometheus/client_golang v1.17.0 // indirect
-	github.com/prometheus/client_model v0.5.0 // indirect
-	github.com/prometheus/common v0.45.0 // indirect
 	github.com/prometheus/procfs v0.12.0 // indirect
 	github.com/robfig/cron v1.2.0 // indirect
+	github.com/rogpeppe/go-internal v1.10.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
+	github.com/samber/lo v1.47.0 // indirect
 	github.com/shopspring/decimal v1.2.0 // indirect
 	github.com/spf13/afero v1.9.4 // indirect
 	github.com/spf13/cast v1.5.0 // indirect
@@ -129,16 +143,15 @@ require (
 	go.starlark.net v0.0.0-20230525235612-a134d8f9ddca // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go4.org v0.0.0-20200104003542-c7e774b10ea0 // indirect
-	golang.org/x/crypto v0.21.0 // indirect
+	golang.org/x/crypto v0.31.0 // indirect
 	golang.org/x/exp v0.0.0-20231006140011-7918f672742d // indirect
-	golang.org/x/mod v0.13.0 // indirect
-	golang.org/x/net v0.23.0 // indirect
+	golang.org/x/mod v0.17.0 // indirect
 	golang.org/x/oauth2 v0.13.0 // indirect
-	golang.org/x/sync v0.4.0 // indirect
-	golang.org/x/sys v0.20.0 // indirect
-	golang.org/x/term v0.18.0 // indirect
-	golang.org/x/text v0.14.0 // indirect
-	golang.org/x/tools v0.14.0 // indirect
+	golang.org/x/sync v0.10.0 // indirect
+	golang.org/x/sys v0.28.0 // indirect
+	golang.org/x/term v0.27.0 // indirect
+	golang.org/x/text v0.21.0 // indirect
+	golang.org/x/tools v0.21.1-0.20240508182429-e35e4ccd0d2d // indirect
 	gomodules.xyz/jsonpatch/v2 v2.4.0 // indirect
 	google.golang.org/appengine v1.6.8 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20230525234030-28d5490b6b19 // indirect

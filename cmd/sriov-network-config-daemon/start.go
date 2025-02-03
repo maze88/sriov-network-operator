@@ -26,6 +26,7 @@ import (
 
 	"github.com/spf13/cobra"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -41,6 +42,7 @@ import (
 	snclientset "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/client/clientset/versioned"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/daemon"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/featuregate"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/helper"
 	snolog "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/log"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/platforms"
@@ -79,11 +81,13 @@ var (
 	}
 
 	startOpts struct {
-		kubeconfig        string
-		nodeName          string
-		systemd           bool
-		disabledPlugins   stringList
-		parallelNicConfig bool
+		kubeconfig            string
+		nodeName              string
+		systemd               bool
+		disabledPlugins       stringList
+		parallelNicConfig     bool
+		manageSoftwareBridges bool
+		ovsSocketPath         string
 	}
 )
 
@@ -94,6 +98,8 @@ func init() {
 	startCmd.PersistentFlags().BoolVar(&startOpts.systemd, "use-systemd-service", false, "use config daemon in systemd mode")
 	startCmd.PersistentFlags().VarP(&startOpts.disabledPlugins, "disable-plugins", "", "comma-separated list of plugins to disable")
 	startCmd.PersistentFlags().BoolVar(&startOpts.parallelNicConfig, "parallel-nic-config", false, "perform NIC configuration in parallel")
+	startCmd.PersistentFlags().BoolVar(&startOpts.manageSoftwareBridges, "manage-software-bridges", false, "enable management of software bridges")
+	startCmd.PersistentFlags().StringVar(&startOpts.ovsSocketPath, "ovs-socket-path", vars.OVSDBSocketPath, "path for OVSDB socket")
 }
 
 func runStartCmd(cmd *cobra.Command, args []string) error {
@@ -108,6 +114,8 @@ func runStartCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	vars.ParallelNicConfig = startOpts.parallelNicConfig
+	vars.ManageSoftwareBridges = startOpts.manageSoftwareBridges
+	vars.OVSDBSocketPath = startOpts.ovsSocketPath
 
 	if startOpts.nodeName == "" {
 		name, ok := os.LookupEnv("NODE_NAME")
@@ -273,6 +281,18 @@ func runStartCmd(cmd *cobra.Command, args []string) error {
 	}
 	go nodeWriter.Run(stopCh, refreshCh, syncCh)
 
+	// Init feature gates once to prevent race conditions.
+	defaultConfig := &sriovnetworkv1.SriovOperatorConfig{}
+	err = kClient.Get(context.Background(), types.NamespacedName{Namespace: vars.Namespace, Name: consts.DefaultConfigName}, defaultConfig)
+	if err != nil {
+		log.Log.Error(err, "Failed to get default SriovOperatorConfig object")
+		return err
+	}
+	featureGates := featuregate.New()
+	featureGates.Init(defaultConfig.Spec.FeatureGates)
+	vars.MlxPluginFwReset = featureGates.IsEnabled(consts.MellanoxFirmwareResetFeatureGate)
+	log.Log.Info("Enabled featureGates", "featureGates", featureGates.String())
+
 	setupLog.V(0).Info("Starting SriovNetworkConfigDaemon")
 	err = daemon.New(
 		kClient,
@@ -285,6 +305,7 @@ func runStartCmd(cmd *cobra.Command, args []string) error {
 		syncCh,
 		refreshCh,
 		eventRecorder,
+		featureGates,
 		startOpts.disabledPlugins,
 	).Run(stopCh, exitCh)
 	if err != nil {

@@ -189,6 +189,21 @@ func (mr *MockNetlinkLibMockRecorder) LinkByName(name interface{}) *gomock.Call 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LinkByName", reflect.TypeOf((*MockNetlinkLib)(nil).LinkByName), name)
 }
 
+// LinkList mocks base method.
+func (m *MockNetlinkLib) LinkList() ([]netlink.Link, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "LinkList")
+	ret0, _ := ret[0].([]netlink.Link)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// LinkList indicates an expected call of LinkList.
+func (mr *MockNetlinkLibMockRecorder) LinkList() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LinkList", reflect.TypeOf((*MockNetlinkLib)(nil).LinkList))
+}
+
 // LinkSetMTU mocks base method.
 func (m *MockNetlinkLib) LinkSetMTU(link netlink.Link, mtu int) error {
 	m.ctrl.T.Helper()
@@ -272,6 +287,21 @@ func (m *MockNetlinkLib) RdmaLinkByName(name string) (*netlink0.RdmaLink, error)
 func (mr *MockNetlinkLibMockRecorder) RdmaLinkByName(name interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RdmaLinkByName", reflect.TypeOf((*MockNetlinkLib)(nil).RdmaLinkByName), name)
+}
+
+// RdmaSystemGetNetnsMode mocks base method.
+func (m *MockNetlinkLib) RdmaSystemGetNetnsMode() (string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RdmaSystemGetNetnsMode")
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// RdmaSystemGetNetnsMode indicates an expected call of RdmaSystemGetNetnsMode.
+func (mr *MockNetlinkLibMockRecorder) RdmaSystemGetNetnsMode() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RdmaSystemGetNetnsMode", reflect.TypeOf((*MockNetlinkLib)(nil).RdmaSystemGetNetnsMode))
 }
 
 // VDPADelDev mocks base method.

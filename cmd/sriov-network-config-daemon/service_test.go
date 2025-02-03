@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 
+	"github.com/go-logr/logr"
 	"github.com/golang/mock/gomock"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -38,7 +39,6 @@ func restoreOrigFuncs() {
 
 func getTestSriovInterfaceConfig(platform int) []byte {
 	return []byte(fmt.Sprintf(`spec:
-    dpconfigversion: ""
     interfaces:
         - pciaddress: 0000:d8:00.0
           numvfs: 4
@@ -57,6 +57,7 @@ func getTestSriovInterfaceConfig(platform int) []byte {
           externallymanaged: false
 unsupportedNics: false
 platformType: %d
+manageSoftwareBridges: true
 `, platform))
 }
 
@@ -158,7 +159,9 @@ var _ = Describe("Service", func() {
 				"/etc/sriov-operator/sriov-interface-result.yaml":   []byte("something"),
 			},
 		})
-		hostHelpers.EXPECT().TryEnableRdma().Return(true, nil)
+		hostHelpers.EXPECT().TryGetInterfaceName("0000:d8:00.0").Return("enp216s0f0np0")
+		hostHelpers.EXPECT().WaitUdevEventsProcessed(60).Return(nil)
+		hostHelpers.EXPECT().CheckRDMAEnabled().Return(true, nil)
 		hostHelpers.EXPECT().TryEnableTun().Return()
 		hostHelpers.EXPECT().TryEnableVhostNet().Return()
 		hostHelpers.EXPECT().DiscoverSriovDevices(hostHelpers).Return([]sriovnetworkv1.InterfaceExt{{
@@ -183,7 +186,7 @@ var _ = Describe("Service", func() {
 				"/etc/sriov-operator/sriov-interface-result.yaml":   []byte("something"),
 			},
 		})
-		hostHelpers.EXPECT().TryEnableRdma().Return(true, nil)
+		hostHelpers.EXPECT().CheckRDMAEnabled().Return(true, nil)
 		hostHelpers.EXPECT().TryEnableTun().Return()
 		hostHelpers.EXPECT().TryEnableVhostNet().Return()
 
@@ -211,7 +214,9 @@ var _ = Describe("Service", func() {
 				"/etc/sriov-operator/sriov-interface-result.yaml":   []byte("something"),
 			},
 		})
-		hostHelpers.EXPECT().TryEnableRdma().Return(true, nil)
+		hostHelpers.EXPECT().TryGetInterfaceName("0000:d8:00.0").Return("enp216s0f0np0")
+		hostHelpers.EXPECT().WaitUdevEventsProcessed(60).Return(nil)
+		hostHelpers.EXPECT().CheckRDMAEnabled().Return(true, nil)
 		hostHelpers.EXPECT().TryEnableTun().Return()
 		hostHelpers.EXPECT().TryEnableVhostNet().Return()
 		hostHelpers.EXPECT().DiscoverSriovDevices(hostHelpers).Return([]sriovnetworkv1.InterfaceExt{{
@@ -236,9 +241,12 @@ var _ = Describe("Service", func() {
 				"/etc/sriov-operator/sriov-interface-result.yaml":   getTestResultFileContent("InProgress", ""),
 			},
 		})
+		hostHelpers.EXPECT().TryGetInterfaceName("0000:d8:00.0").Return("enp216s0f0np0")
+		hostHelpers.EXPECT().WaitUdevEventsProcessed(60).Return(nil)
 		hostHelpers.EXPECT().DiscoverSriovDevices(hostHelpers).Return([]sriovnetworkv1.InterfaceExt{{
 			Name: "enp216s0f0np0",
 		}}, nil)
+		hostHelpers.EXPECT().DiscoverBridges().Return(sriovnetworkv1.Bridges{}, nil)
 		genericPlugin.EXPECT().OnNodeStateChange(newNodeStateContainsDeviceMatcher("enp216s0f0np0")).Return(true, false, nil)
 		genericPlugin.EXPECT().Apply().Return(nil)
 		Expect(runServiceCmd(&cobra.Command{}, []string{})).NotTo(HaveOccurred())
@@ -274,5 +282,18 @@ var _ = Describe("Service", func() {
 		Expect(runServiceCmd(&cobra.Command{}, []string{})).To(HaveOccurred())
 		testHelpers.GinkgoAssertFileContentsEquals("/etc/sriov-operator/sriov-interface-result.yaml",
 			string(getTestResultFileContent("Failed", "post: unexpected result of the pre phase: Failed, syncError: pretest")))
+	})
+	It("waitForDevicesInitialization", func() {
+		cfg := &systemd.SriovConfig{Spec: sriovnetworkv1.SriovNetworkNodeStateSpec{
+			Interfaces: []sriovnetworkv1.Interface{
+				{Name: "name1", PciAddress: "0000:d8:00.0"},
+				{Name: "name2", PciAddress: "0000:d8:00.1"}}}}
+		hostHelpers.EXPECT().TryGetInterfaceName("0000:d8:00.0").Return("other")
+		hostHelpers.EXPECT().TryGetInterfaceName("0000:d8:00.1").Return("")
+		hostHelpers.EXPECT().TryGetInterfaceName("0000:d8:00.0").Return("name1")
+		hostHelpers.EXPECT().TryGetInterfaceName("0000:d8:00.1").Return("")
+		hostHelpers.EXPECT().TryGetInterfaceName("0000:d8:00.1").Return("name2")
+		hostHelpers.EXPECT().WaitUdevEventsProcessed(60).Return(nil)
+		waitForDevicesInitialization(logr.Discard(), cfg, hostHelpers)
 	})
 })

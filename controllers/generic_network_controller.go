@@ -18,10 +18,10 @@ package controllers
 
 import (
 	"context"
-	"reflect"
 
 	netattdefv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -36,10 +36,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/utils"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
 )
 
-type networkCRInstance interface {
+type NetworkCRInstance interface {
 	client.Object
 	// renders NetAttDef from the network instance
 	RenderNetAttDef() (*uns.Unstructured, error)
@@ -52,7 +53,7 @@ type networkController interface {
 	reconcile.Reconciler
 	// GetObject should return CR type which implements networkCRInstance
 	// interface
-	GetObject() networkCRInstance
+	GetObject() NetworkCRInstance
 	// should return CR list type
 	GetObjectList() client.ObjectList
 	// should return name of the controller
@@ -168,9 +169,9 @@ func (r *genericNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				reqLogger.Error(err, "Couldn't create NetworkAttachmentDefinition CR", "Namespace", netAttDef.Namespace, "Name", netAttDef.Name)
 				return reconcile.Result{}, err
 			}
-			anno := map[string]string{sriovnetworkv1.LASTNETWORKNAMESPACE: netAttDef.Namespace}
-			instance.SetAnnotations(anno)
-			if err := r.Update(ctx, instance); err != nil {
+
+			err = utils.AnnotateObject(ctx, instance, sriovnetworkv1.LASTNETWORKNAMESPACE, netAttDef.Namespace, r.Client)
+			if err != nil {
 				return reconcile.Result{}, err
 			}
 		} else {
@@ -179,7 +180,7 @@ func (r *genericNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	} else {
 		reqLogger.Info("NetworkAttachmentDefinition CR already exist")
-		if !reflect.DeepEqual(found.Spec, netAttDef.Spec) || !reflect.DeepEqual(found.GetAnnotations(), netAttDef.GetAnnotations()) {
+		if !equality.Semantic.DeepEqual(found.Spec, netAttDef.Spec) || !equality.Semantic.DeepEqual(found.GetAnnotations(), netAttDef.GetAnnotations()) {
 			reqLogger.Info("Update NetworkAttachmentDefinition CR", "Namespace", netAttDef.Namespace, "Name", netAttDef.Name)
 			netAttDef.SetResourceVersion(found.GetResourceVersion())
 			err = r.Update(ctx, netAttDef)
@@ -206,7 +207,7 @@ func (r *genericNetworkReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r.controller)
 }
 
-func (r *genericNetworkReconciler) namespaceHandlerCreate(ctx context.Context, e event.CreateEvent, q workqueue.RateLimitingInterface) {
+func (r *genericNetworkReconciler) namespaceHandlerCreate(ctx context.Context, e event.TypedCreateEvent[client.Object], w workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	networkList := r.controller.GetObjectList()
 	err := r.List(ctx,
 		networkList,
@@ -226,7 +227,7 @@ func (r *genericNetworkReconciler) namespaceHandlerCreate(ctx context.Context, e
 	unsList.SetUnstructuredContent(unsContent)
 	_ = unsList.EachListItem(func(o runtime.Object) error {
 		unsObj := o.(*uns.Unstructured)
-		q.Add(reconcile.Request{NamespacedName: types.NamespacedName{
+		w.Add(reconcile.Request{NamespacedName: types.NamespacedName{
 			Namespace: unsObj.GetNamespace(),
 			Name:      unsObj.GetName(),
 		}})
@@ -235,7 +236,7 @@ func (r *genericNetworkReconciler) namespaceHandlerCreate(ctx context.Context, e
 }
 
 // deleteNetAttDef deletes the generated net-att-def CR
-func (r *genericNetworkReconciler) deleteNetAttDef(ctx context.Context, cr networkCRInstance) error {
+func (r *genericNetworkReconciler) deleteNetAttDef(ctx context.Context, cr NetworkCRInstance) error {
 	// Fetch the NetworkAttachmentDefinition instance
 	namespace := cr.NetworkNamespace()
 	if namespace == "" {

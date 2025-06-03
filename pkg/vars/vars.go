@@ -8,6 +8,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/featuregate"
 )
 
 var (
@@ -51,8 +52,14 @@ var (
 	// ParallelNicConfig global variable to perform NIC configuration in parallel
 	ParallelNicConfig = false
 
+	// ManageSoftwareBridges global variable which reflects state of manageSoftwareBridges feature
+	ManageSoftwareBridges = false
+
 	// FilesystemRoot used by test to mock interactions with filesystem
 	FilesystemRoot = ""
+
+	// OVSDBSocketPath path to OVSDB socket
+	OVSDBSocketPath = "unix:///var/run/openvswitch/db.sock"
 
 	//Cluster variables
 	Config *rest.Config    = nil
@@ -66,6 +73,12 @@ var (
 
 	// DisableablePlugins contains which plugins can be disabled in sriov config daemon
 	DisableablePlugins = map[string]struct{}{"mellanox": {}}
+
+	// DisableDrain controls if the daemon will drain the node before configuration
+	DisableDrain = false
+
+	// FeatureGates interface to interact with feature gates
+	FeatureGate featuregate.FeatureGate
 )
 
 func init() {
@@ -86,4 +99,6 @@ func init() {
 	}
 
 	ResourcePrefix = os.Getenv("RESOURCE_PREFIX")
+
+	FeatureGate = featuregate.New()
 }

@@ -37,13 +37,16 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	netattdefv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	openshiftconfigv1 "github.com/openshift/api/config/v1"
-	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
+	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 
 	//+kubebuilder:scaffold:imports
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
+	snolog "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/log"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util"
 )
@@ -62,7 +65,8 @@ const testNamespace = "openshift-sriov-network-operator"
 
 func setupK8sManagerForTest() (manager.Manager, error) {
 	k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme.Scheme,
+		Scheme:  scheme.Scheme,
+		Metrics: server.Options{BindAddress: "0"}, // we don't need metrics server for tests
 	})
 
 	if err != nil {
@@ -93,6 +97,7 @@ var _ = BeforeSuite(func() {
 		func(o *zap.Options) {
 			o.TimeEncoder = zapcore.RFC3339NanoTimeEncoder
 		}))
+	snolog.InitLog()
 
 	// Go to project root directory
 	err = os.Chdir("..")
@@ -115,6 +120,8 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	err = os.Setenv("OVS_CNI_IMAGE", "mock-image")
 	Expect(err).NotTo(HaveOccurred())
+	err = os.Setenv("RDMA_CNI_IMAGE", "mock-image")
+	Expect(err).NotTo(HaveOccurred())
 	err = os.Setenv("SRIOV_DEVICE_PLUGIN_IMAGE", "mock-image")
 	Expect(err).NotTo(HaveOccurred())
 	err = os.Setenv("NETWORK_RESOURCES_INJECTOR_IMAGE", "mock-image")
@@ -134,6 +141,10 @@ var _ = BeforeSuite(func() {
 	err = os.Setenv("METRICS_EXPORTER_PORT", "9110")
 	Expect(err).NotTo(HaveOccurred())
 	err = os.Setenv("METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE", "mock-image")
+	Expect(err).NotTo(HaveOccurred())
+	err = os.Setenv("METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT", "k8s-prometheus")
+	Expect(err).NotTo(HaveOccurred())
+	err = os.Setenv("METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE", "default")
 	Expect(err).NotTo(HaveOccurred())
 
 	By("bootstrapping test environment")
@@ -157,6 +168,8 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	err = openshiftconfigv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
+	err = monitoringv1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
 
 	vars.Config = cfg
 	vars.Scheme = scheme.Scheme
@@ -178,6 +191,13 @@ var _ = BeforeSuite(func() {
 		Status: corev1.NamespaceStatus{},
 	}
 	Expect(k8sClient.Create(context.Background(), ns)).Should(Succeed())
+
+	sa := &corev1.ServiceAccount{TypeMeta: metav1.TypeMeta{},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: testNamespace,
+		}}
+	Expect(k8sClient.Create(context.Background(), sa)).Should(Succeed())
 
 	// Create openshift Infrastructure
 	infra := &openshiftconfigv1.Infrastructure{

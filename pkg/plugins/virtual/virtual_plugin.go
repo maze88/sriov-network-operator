@@ -1,8 +1,7 @@
 package virtual
 
 import (
-	"reflect"
-
+	"k8s.io/apimachinery/pkg/api/equality"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
@@ -34,7 +33,6 @@ const (
 func NewVirtualPlugin(helper helper.HostHelpersInterface) (plugin.VendorPlugin, error) {
 	return &VirtualPlugin{
 		PluginName:     PluginName,
-		SpecVersion:    "1.0",
 		LoadVfioDriver: unloaded,
 		helpers:        helper,
 	}, nil
@@ -43,11 +41,6 @@ func NewVirtualPlugin(helper helper.HostHelpersInterface) (plugin.VendorPlugin, 
 // Name returns the name of the plugin
 func (p *VirtualPlugin) Name() string {
 	return p.PluginName
-}
-
-// Spec returns the version of the spec expected by the plugin
-func (p *VirtualPlugin) Spec() string {
-	return p.SpecVersion
 }
 
 // OnNodeStateChange Invoked when SriovNetworkNodeState CR is created or updated, return if need dain and/or reboot node
@@ -96,7 +89,7 @@ func (p *VirtualPlugin) Apply() error {
 
 	if p.LastState != nil {
 		log.Log.Info("virtual plugin Apply()", "last-state", p.LastState.Spec)
-		if reflect.DeepEqual(p.LastState.Spec.Interfaces, p.DesireState.Spec.Interfaces) {
+		if equality.Semantic.DeepEqual(p.LastState.Spec.Interfaces, p.DesireState.Spec.Interfaces) {
 			log.Log.Info("virtual plugin Apply(): nothing to apply")
 			return nil
 		}
@@ -113,13 +106,6 @@ func (p *VirtualPlugin) Apply() error {
 	*p.LastState = *p.DesireState
 
 	return nil
-}
-
-func (p *VirtualPlugin) SetSystemdFlag() {
-}
-
-func (p *VirtualPlugin) IsSystemService() bool {
-	return false
 }
 
 func needVfioDriver(state *sriovnetworkv1.SriovNetworkNodeState) bool {
@@ -159,10 +145,8 @@ func needUpdateVirtual(iface *sriovnetworkv1.Interface, ifaceStatus *sriovnetwor
 	// The NumVfs is always 1
 	if iface.NumVfs > 0 {
 		for _, vf := range ifaceStatus.VFs {
-			ingroup := false
 			for _, group := range iface.VfGroups {
 				if sriovnetworkv1.IndexInRange(vf.VfID, group.VfRange) {
-					ingroup = true
 					if group.DeviceType != consts.DeviceTypeNetDevice {
 						if group.DeviceType != vf.Driver {
 							log.Log.V(2).Info("needUpdateVirtual(): Driver needs update",
@@ -178,10 +162,6 @@ func needUpdateVirtual(iface *sriovnetworkv1.Interface, ifaceStatus *sriovnetwor
 					}
 					break
 				}
-			}
-			if !ingroup && sriovnetworkv1.StringInArray(vf.Driver, vars.DpdkDrivers) {
-				// VF which has DPDK driver loaded but not in any group, needs to be reset to default driver.
-				return true
 			}
 		}
 	}

@@ -83,11 +83,13 @@ spec:
                           items:
                             type: string
                           type: array
+                          x-kubernetes-list-type: atomic
                       required:
                       - key
                       - operator
                       type: object
                     type: array
+                    x-kubernetes-list-type: atomic
                   matchLabels:
                     additionalProperties:
                       type: string
@@ -111,6 +113,12 @@ spec:
                       Name is the name of MachineConfigPool to be enabled with OVS hardware offload
                     type: string
                 type: object
+              rdmaMode:
+                description: RDMA subsystem. Allowed value "shared", "exclusive".
+                enum:
+                - shared
+                - exclusive
+                type: string
             type: object
           status:
             description: SriovNetworkPoolConfigStatus defines the observed state of

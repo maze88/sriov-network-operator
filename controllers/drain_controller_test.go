@@ -7,7 +7,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/golang/mock/gomock"
+	"go.uber.org/mock/gomock"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,7 +17,7 @@ import (
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
+	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
 	constants "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
@@ -90,8 +90,9 @@ var _ = Describe("Drain Controller", Ordered, func() {
 	})
 
 	BeforeEach(func() {
-		Expect(k8sClient.DeleteAllOf(context.Background(), &corev1.Node{})).ToNot(HaveOccurred())
-		Expect(k8sClient.DeleteAllOf(context.Background(), &sriovnetworkv1.SriovNetworkNodeState{}, client.InNamespace(vars.Namespace))).ToNot(HaveOccurred())
+		Expect(k8sClient.DeleteAllOf(context.Background(), &corev1.Node{}, &client.DeleteAllOfOptions{DeleteOptions: client.DeleteOptions{GracePeriodSeconds: pointer.Int64(0)}})).ToNot(HaveOccurred())
+		Expect(k8sClient.DeleteAllOf(context.Background(), &sriovnetworkv1.SriovNetworkNodeState{}, client.InNamespace(vars.Namespace), &client.DeleteAllOfOptions{DeleteOptions: client.DeleteOptions{GracePeriodSeconds: pointer.Int64(0)}})).ToNot(HaveOccurred())
+		Expect(k8sClient.DeleteAllOf(context.Background(), &corev1.Pod{}, client.InNamespace(testNamespace), &client.DeleteAllOfOptions{DeleteOptions: client.DeleteOptions{GracePeriodSeconds: pointer.Int64(0)}})).ToNot(HaveOccurred())
 
 		poolConfig := &sriovnetworkv1.SriovNetworkPoolConfig{}
 		poolConfig.SetNamespace(testNamespace)
@@ -113,7 +114,7 @@ var _ = Describe("Drain Controller", Ordered, func() {
 
 	Context("when there is only one node", func() {
 
-		It("should drain", func(ctx context.Context) {
+		It("should drain single node on drain require", func(ctx context.Context) {
 			node, nodeState := createNode(ctx, "node1")
 
 			simulateDaemonSetAnnotation(node, constants.DrainRequired)
@@ -123,6 +124,33 @@ var _ = Describe("Drain Controller", Ordered, func() {
 
 			simulateDaemonSetAnnotation(node, constants.DrainIdle)
 
+			expectNodeStateAnnotation(nodeState, constants.DrainIdle)
+			expectNodeIsSchedulable(node)
+		})
+
+		It("should not drain on reboot for single node", func(ctx context.Context) {
+			node, nodeState := createNode(ctx, "node1")
+
+			simulateDaemonSetAnnotation(node, constants.RebootRequired)
+
+			expectNodeStateAnnotation(nodeState, constants.DrainComplete)
+			expectNodeIsSchedulable(node)
+
+			simulateDaemonSetAnnotation(node, constants.DrainIdle)
+			expectNodeStateAnnotation(nodeState, constants.DrainIdle)
+			expectNodeIsSchedulable(node)
+		})
+
+		It("should drain on reboot for multiple node", func(ctx context.Context) {
+			node, nodeState := createNode(ctx, "node1")
+			createNode(ctx, "node2")
+
+			simulateDaemonSetAnnotation(node, constants.RebootRequired)
+
+			expectNodeStateAnnotation(nodeState, constants.DrainComplete)
+			expectNodeIsNotSchedulable(node)
+
+			simulateDaemonSetAnnotation(node, constants.DrainIdle)
 			expectNodeStateAnnotation(nodeState, constants.DrainIdle)
 			expectNodeIsSchedulable(node)
 		})
@@ -428,7 +456,7 @@ func createNodeWithLabel(ctx context.Context, nodeName string, label string) (*c
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      nodeName,
 			Namespace: vars.Namespace,
-			Labels: map[string]string{
+			Annotations: map[string]string{
 				constants.NodeStateDrainAnnotationCurrent: constants.DrainIdle,
 			},
 		},

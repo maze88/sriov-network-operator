@@ -20,6 +20,7 @@ import (
 type ManagerInterface interface {
 	ClearPCIAddressFolder() error
 	SaveLastPfAppliedStatus(PfInfo *sriovnetworkv1.Interface) error
+	RemovePfAppliedStatus(pciAddress string) error
 	LoadPfsStatus(pciAddress string) (*sriovnetworkv1.Interface, bool, error)
 
 	GetCheckPointNodeState() (*sriovnetworkv1.SriovNetworkNodeState, error)
@@ -46,7 +47,7 @@ func createOperatorConfigFolderIfNeeded() error {
 	_, err := os.Stat(SriovConfBasePathUse)
 	if err != nil {
 		if os.IsNotExist(err) {
-			err = os.MkdirAll(SriovConfBasePathUse, os.ModeDir)
+			err = os.MkdirAll(SriovConfBasePathUse, 0777)
 			if err != nil {
 				return fmt.Errorf("failed to create the sriov config folder on host in path %s: %v", SriovConfBasePathUse, err)
 			}
@@ -59,7 +60,7 @@ func createOperatorConfigFolderIfNeeded() error {
 	_, err = os.Stat(PfAppliedConfigUse)
 	if err != nil {
 		if os.IsNotExist(err) {
-			err = os.MkdirAll(PfAppliedConfigUse, os.ModeDir)
+			err = os.MkdirAll(PfAppliedConfigUse, 0777)
 			if err != nil {
 				return fmt.Errorf("failed to create the pci folder on host in path %s: %v", PfAppliedConfigUse, err)
 			}
@@ -88,7 +89,7 @@ func (s *manager) ClearPCIAddressFolder() error {
 		return fmt.Errorf("failed to remove the PCI address folder on path %s: %v", PfAppliedConfigUse, err)
 	}
 
-	err = os.Mkdir(PfAppliedConfigUse, os.ModeDir)
+	err = os.Mkdir(PfAppliedConfigUse, 0777)
 	if err != nil {
 		return fmt.Errorf("failed to create the pci folder on host in path %s: %v", PfAppliedConfigUse, err)
 	}
@@ -109,6 +110,17 @@ func (s *manager) SaveLastPfAppliedStatus(PfInfo *sriovnetworkv1.Interface) erro
 	pathFile := filepath.Join(hostExtension, consts.PfAppliedConfig, PfInfo.PciAddress)
 	err = os.WriteFile(pathFile, data, 0644)
 	return err
+}
+
+func (s *manager) RemovePfAppliedStatus(pciAddress string) error {
+	hostExtension := utils.GetHostExtension()
+	pathFile := filepath.Join(hostExtension, consts.PfAppliedConfig, pciAddress)
+	err := os.RemoveAll(pathFile)
+	if err != nil {
+		log.Log.Error(err, "failed to remove PF status", "pathFile", pathFile)
+		return err
+	}
+	return nil
 }
 
 // LoadPfsStatus convert the /etc/sriov-operator/pci/<pci-address> json to pfstatus
@@ -162,7 +174,7 @@ func (s *manager) WriteCheckpointFile(ns *sriovnetworkv1.SriovNetworkNodeState) 
 	defer file.Close()
 	log.Log.Info("WriteCheckpointFile(): try to decode the checkpoint file")
 	if err = json.NewDecoder(file).Decode(&sriovnetworkv1.InitialState); err != nil {
-		log.Log.V(2).Error(err, "WriteCheckpointFile(): fail to decode, writing new file instead")
+		log.Log.Error(err, "WriteCheckpointFile(): fail to decode, writing new file instead")
 		log.Log.Info("WriteCheckpointFile(): write checkpoint file")
 		if err = file.Truncate(0); err != nil {
 			return err

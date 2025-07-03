@@ -14,7 +14,10 @@ const (
 	Chroot = "/host"
 	Host   = "/host"
 
-	ResyncPeriod                       = 5 * time.Minute
+	ResyncPeriod               = 5 * time.Minute
+	DaemonRequeueTime          = 30 * time.Second
+	DrainControllerRequeueTime = 5 * time.Second
+
 	DefaultConfigName                  = "default"
 	ConfigDaemonPath                   = "./bindata/manifests/daemon"
 	InjectorWebHookPath                = "./bindata/manifests/webhook"
@@ -36,7 +39,6 @@ const (
 	ServiceAccount                     = "ServiceAccount"
 	DPConfigFileName                   = "config.json"
 	OVSHWOLMachineConfigNameSuffix     = "ovs-hw-offload"
-	LeaderElectionID                   = "a56def2a.openshift.io"
 
 	LinkTypeEthernet   = "ether"
 	LinkTypeInfiniband = "infiniband"
@@ -54,6 +56,9 @@ const (
 	VdpaTypeVirtio      = "virtio"
 	VdpaTypeVhost       = "vhost"
 
+	RdmaSubsystemModeShared    = "shared"
+	RdmaSubsystemModeExclusive = "exclusive"
+
 	ClusterTypeOpenshift  = "openshift"
 	ClusterTypeKubernetes = "kubernetes"
 
@@ -61,10 +66,15 @@ const (
 	PfAppliedConfig            = SriovConfBasePath + "/pci"
 	SriovSwitchDevConfPath     = SriovConfBasePath + "/sriov_config.json"
 	SriovHostSwitchDevConfPath = Host + SriovSwitchDevConfPath
+	ManagedOVSBridgesPath      = SriovConfBasePath + "/managed-ovs-bridges.json"
 
 	MachineConfigPoolPausedAnnotation       = "sriovnetwork.openshift.io/state"
 	MachineConfigPoolPausedAnnotationIdle   = "Idle"
 	MachineConfigPoolPausedAnnotationPaused = "Paused"
+
+	SriovDevicePluginLabel         = "sriovnetwork.openshift.io/device-plugin"
+	SriovDevicePluginLabelEnabled  = "Enabled"
+	SriovDevicePluginLabelDisabled = "Disabled"
 
 	NodeDrainAnnotation             = "sriovnetwork.openshift.io/state"
 	NodeStateDrainAnnotation        = "sriovnetwork.openshift.io/desired-state"
@@ -80,10 +90,20 @@ const (
 	SyncStatusInProgress = "InProgress"
 
 	DrainDeleted = "Deleted"
+	DrainDelete  = "delete"
 	DrainEvicted = "Evicted"
+	DrainEvict   = "evict"
 
 	MCPPauseAnnotationState = "sriovnetwork.openshift.io/state"
 	MCPPauseAnnotationTime  = "sriovnetwork.openshift.io/time"
+
+	// NodeStateKeepUntilAnnotation contains name of the "keep until time" annotation for SriovNetworkNodeState object.
+	// The "keep until time" specifies the earliest time at which the state object can be removed
+	// if the daemon's pod is not found on the node.
+	NodeStateKeepUntilAnnotation = "sriovnetwork.openshift.io/keep-state-until"
+	// DefaultNodeStateCleanupDelayMinutes contains default delay before removing stale SriovNetworkNodeState CRs
+	// (the CRs that no longer have a corresponding node with the daemon).
+	DefaultNodeStateCleanupDelayMinutes = 30
 
 	CheckpointFileName = "sno-initial-node-state.json"
 	Unknown            = "Unknown"
@@ -120,9 +140,21 @@ const (
 		`IMPORT{program}="/etc/udev/switchdev-vf-link-name.sh $attr{phys_port_name}", ` +
 		`NAME="%s_$env{NUMBER}"`
 
-	KernelArgPciRealloc = "pci=realloc"
-	KernelArgIntelIommu = "intel_iommu=on"
-	KernelArgIommuPt    = "iommu=pt"
+	KernelArgPciRealloc    = "pci=realloc"
+	KernelArgIntelIommu    = "intel_iommu=on"
+	KernelArgIommuPt       = "iommu=pt"
+	KernelArgRdmaShared    = "ib_core.netns_mode=1"
+	KernelArgRdmaExclusive = "ib_core.netns_mode=0"
+
+	// Systemd consts
+	SriovSystemdConfigPath        = SriovConfBasePath + "/sriov-interface-config.yaml"
+	SriovSystemdResultPath        = SriovConfBasePath + "/sriov-interface-result.yaml"
+	SriovSystemdSupportedNicPath  = SriovConfBasePath + "/sriov-supported-nics-ids.yaml"
+	SriovSystemdServiceBinaryPath = "/var/lib/sriov/sriov-network-config-daemon"
+
+	SriovServiceBasePath        = "/etc/systemd/system"
+	SriovServicePath            = SriovServiceBasePath + "/sriov-config.service"
+	SriovPostNetworkServicePath = SriovServiceBasePath + "/sriov-config-post-network.service"
 
 	// Feature gates
 	// ParallelNicConfigFeatureGate: allow to configure nics in parallel
@@ -134,6 +166,15 @@ const (
 
 	// MetricsExporterFeatureGate: enable SriovNetworkMetricsExporter on the same node as where the config-daemon run
 	MetricsExporterFeatureGate = "metricsExporter"
+
+	// ManageSoftwareBridgesFeatureGate: enables management of software bridges by the operator
+	ManageSoftwareBridgesFeatureGate = "manageSoftwareBridges"
+
+	// MellanoxFirmwareResetFeatureGate: enables the firmware reset via mstfwreset before a reboot
+	MellanoxFirmwareResetFeatureGate = "mellanoxFirmwareReset"
+
+	// The path to the file on the host filesystem that contains the IB GUID distribution for IB VFs
+	InfinibandGUIDConfigFilePath = SriovConfBasePath + "/infiniband/guids"
 )
 
 const (

@@ -17,18 +17,20 @@ spec:
     matchLabels:
       control-plane: controller-manager
   replicas: 1
+  strategy:
+    type: Recreate
   template:
     metadata:
       labels:
         control-plane: controller-manager
+      annotations:
+        openshift.io/required-scc: restricted-v2
     spec:
       securityContext:
         runAsNonRoot: true
       containers:
       - command:
         - /manager
-        args:
-        - --leader-elect
         image: controller:latest
         name: manager
         securityContext:

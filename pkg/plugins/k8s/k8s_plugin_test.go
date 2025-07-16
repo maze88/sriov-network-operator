@@ -5,9 +5,9 @@ import (
 	"os"
 	"testing"
 
-	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
 	"go.uber.org/zap/zapcore"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -79,7 +79,7 @@ var _ = Describe("K8s plugin", func() {
 		testCtrl = gomock.NewController(GinkgoT())
 
 		hostHelper = mock_helper.NewMockHostHelpersInterface(testCtrl)
-		realHostMgr := host.NewHostManager(hostHelper)
+		realHostMgr, _ := host.NewHostManager(hostHelper)
 
 		// proxy some functions to real host manager to simplify testing and to additionally validate manifests
 		for _, f := range []string{

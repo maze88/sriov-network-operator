@@ -293,7 +293,7 @@ podman rmi -fi ${SRIOV_NETWORK_WEBHOOK_IMAGE}
 podman logout $registry
 
 echo "## apply CRDs"
-kubectl apply -k $root/config/crd
+kubectl apply -f $root/config/crd/bases
 
 
 cat <<EOF | kubectl apply -f -

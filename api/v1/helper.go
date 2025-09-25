@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -31,10 +30,12 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
@@ -667,6 +668,7 @@ func (cr *SriovIBNetwork) RenderNetAttDef() (*uns.Unstructured, error) {
 	} else {
 		data.Data["SriovNetworkNamespace"] = cr.Spec.NetworkNamespace
 	}
+	data.Data["Owner"] = OwnerRefToString(cr)
 	data.Data["SriovCniResourceName"] = os.Getenv("RESOURCE_PREFIX") + "/" + cr.Spec.ResourceName
 
 	data.Data["StateConfigured"] = true
@@ -735,6 +737,7 @@ func (cr *SriovNetwork) RenderNetAttDef() (*uns.Unstructured, error) {
 	} else {
 		data.Data["SriovNetworkNamespace"] = cr.Spec.NetworkNamespace
 	}
+	data.Data["Owner"] = OwnerRefToString(cr)
 	data.Data["SriovCniResourceName"] = os.Getenv("RESOURCE_PREFIX") + "/" + cr.Spec.ResourceName
 	data.Data["SriovCniVlan"] = cr.Spec.Vlan
 
@@ -853,6 +856,7 @@ func (cr *OVSNetwork) RenderNetAttDef() (*uns.Unstructured, error) {
 	} else {
 		data.Data["NetworkNamespace"] = cr.Spec.NetworkNamespace
 	}
+	data.Data["Owner"] = OwnerRefToString(cr)
 	data.Data["CniResourceName"] = os.Getenv("RESOURCE_PREFIX") + "/" + cr.Spec.ResourceName
 
 	if cr.Spec.Capabilities == "" {
@@ -968,7 +972,7 @@ func GenerateBridgeName(iface *InterfaceExt) string {
 
 // NeedToUpdateBridges returns true if bridge for the host requires update
 func NeedToUpdateBridges(bridgeSpec, bridgeStatus *Bridges) bool {
-	return !reflect.DeepEqual(bridgeSpec, bridgeStatus)
+	return !equality.Semantic.DeepEqual(bridgeSpec, bridgeStatus)
 }
 
 // SetKeepUntilTime sets an annotation to hold the "keep until time" for the node’s state.
@@ -1009,4 +1013,15 @@ func (s *SriovNetworkNodeState) ResetKeepUntilTime() bool {
 	delete(annotations, consts.NodeStateKeepUntilAnnotation)
 	s.SetAnnotations(annotations)
 	return true
+}
+
+func OwnerRefToString(cr client.Object) string {
+	if cr == nil {
+		return "owner-object-not-found"
+	}
+	if cr.GetObjectKind().GroupVersionKind().Empty() {
+		return "unknown/" + cr.GetNamespace() + "/" + cr.GetName()
+	}
+
+	return cr.GetObjectKind().GroupVersionKind().GroupKind().String() + "/" + cr.GetNamespace() + "/" + cr.GetName()
 }

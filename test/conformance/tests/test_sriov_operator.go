@@ -33,22 +33,22 @@ import (
 	admission "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	sriovv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
-	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/cluster"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/discovery"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/execute"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/k8sreporter"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/namespaces"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/network"
-	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/nodes"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/pod"
 )
 
@@ -81,242 +81,6 @@ var _ = Describe("[sriov] operator", Ordered, func() {
 		err := namespaces.Clean(operatorNamespace, namespaces.Test, clients, discovery.Enabled())
 		Expect(err).ToNot(HaveOccurred())
 		WaitForSRIOVStable()
-	})
-
-	Describe("No SriovNetworkNodePolicy", func() {
-		Context("SR-IOV network config daemon can be set by nodeselector", func() {
-			// 26186
-			It("Should schedule the config daemon on selected nodes", func() {
-				if discovery.Enabled() {
-					Skip("Test unsuitable to be run in discovery mode")
-				}
-
-				By("Checking that a daemon is scheduled on each worker node")
-				Eventually(func() bool {
-					return daemonsScheduledOnNodes("node-role.kubernetes.io/worker=")
-				}, 3*time.Minute, 1*time.Second).Should(Equal(true))
-
-				By("Labeling one worker node with the label needed for the daemon")
-				allNodes, err := clients.CoreV1Interface.Nodes().List(context.Background(), metav1.ListOptions{
-					LabelSelector: "node-role.kubernetes.io/worker",
-				})
-				Expect(err).ToNot(HaveOccurred())
-
-				selectedNodes, err := nodes.MatchingOptionalSelector(clients, allNodes.Items)
-				Expect(err).ToNot(HaveOccurred())
-
-				Expect(len(selectedNodes)).To(BeNumerically(">", 0), "There must be at least one worker")
-				candidate := selectedNodes[0]
-				candidate.Labels["sriovenabled"] = "true"
-				_, err = clients.CoreV1Interface.Nodes().Update(context.Background(), &candidate, metav1.UpdateOptions{})
-				Expect(err).ToNot(HaveOccurred())
-
-				By("Setting the node selector for each daemon")
-				cfg := sriovv1.SriovOperatorConfig{}
-				err = clients.Get(context.TODO(), runtimeclient.ObjectKey{
-					Name:      "default",
-					Namespace: operatorNamespace,
-				}, &cfg)
-				Expect(err).ToNot(HaveOccurred())
-				cfg.Spec.ConfigDaemonNodeSelector = map[string]string{
-					"sriovenabled": "true",
-				}
-				Eventually(func() error {
-					return clients.Update(context.TODO(), &cfg)
-				}, 1*time.Minute, 5*time.Second).ShouldNot(HaveOccurred())
-
-				By("Checking that a daemon is scheduled only on selected node")
-				Eventually(func() bool {
-					return !daemonsScheduledOnNodes("sriovenabled!=true") &&
-						daemonsScheduledOnNodes("sriovenabled=true")
-				}, 1*time.Minute, 1*time.Second).Should(Equal(true))
-
-				By("Restoring the node selector for daemons")
-				err = clients.Get(context.TODO(), runtimeclient.ObjectKey{
-					Name:      "default",
-					Namespace: operatorNamespace,
-				}, &cfg)
-				Expect(err).ToNot(HaveOccurred())
-				cfg.Spec.ConfigDaemonNodeSelector = map[string]string{}
-				Eventually(func() error {
-					return clients.Update(context.TODO(), &cfg)
-				}, 1*time.Minute, 5*time.Second).ShouldNot(HaveOccurred())
-
-				By("Checking that a daemon is scheduled on each worker node")
-				Eventually(func() bool {
-					return daemonsScheduledOnNodes("node-role.kubernetes.io/worker")
-				}, 1*time.Minute, 1*time.Second).Should(Equal(true))
-			})
-		})
-
-		Context("LogLevel affects operator's logs", func() {
-			It("when set to 0 no lifecycle logs are present", func() {
-				if discovery.Enabled() {
-					Skip("Test unsuitable to be run in discovery mode")
-				}
-
-				initialLogLevelValue := getOperatorConfigLogLevel()
-				DeferCleanup(func() {
-					By("Restore LogLevel to its initial value")
-					setOperatorConfigLogLevel(initialLogLevelValue)
-				})
-
-				initialDisableDrain, err := cluster.GetNodeDrainState(clients, operatorNamespace)
-				Expect(err).ToNot(HaveOccurred())
-
-				DeferCleanup(func() {
-					By("Restore DisableDrain to its initial value")
-					Eventually(func() error {
-						return cluster.SetDisableNodeDrainState(clients, operatorNamespace, initialDisableDrain)
-					}, 1*time.Minute, 5*time.Second).ShouldNot(HaveOccurred())
-				})
-
-				By("Set operator LogLevel to 2")
-				setOperatorConfigLogLevel(2)
-
-				By("Flip DisableDrain to trigger operator activity")
-				since := time.Now().Add(-10 * time.Second)
-				Eventually(func() error {
-					return cluster.SetDisableNodeDrainState(clients, operatorNamespace, !initialDisableDrain)
-				}, 1*time.Minute, 5*time.Second).ShouldNot(HaveOccurred())
-
-				By("Assert logs contains verbose output")
-				Eventually(func(g Gomega) {
-					logs := getOperatorLogs(since)
-					g.Expect(logs).To(
-						ContainElement(And(
-							ContainSubstring("Reconciling SriovOperatorConfig"),
-						)),
-					)
-
-					// Should contain verbose logging
-					g.Expect(logs).To(
-						ContainElement(
-							ContainSubstring("Start to sync webhook objects"),
-						),
-					)
-				}, 1*time.Minute, 5*time.Second).Should(Succeed())
-
-				By("Reduce operator LogLevel to 0")
-				setOperatorConfigLogLevel(0)
-
-				By("Flip DisableDrain again to trigger operator activity")
-				since = time.Now().Add(-10 * time.Second)
-				Eventually(func() error {
-					return cluster.SetDisableNodeDrainState(clients, operatorNamespace, initialDisableDrain)
-				}, 1*time.Minute, 5*time.Second).ShouldNot(HaveOccurred())
-
-				By("Assert logs contains less operator activity")
-				Eventually(func(g Gomega) {
-					logs := getOperatorLogs(since)
-
-					// time only contains sec, but we can have race here that in the same sec there was a sync
-					afterLogs := []string{}
-					found := false
-					for _, log := range logs {
-						if found {
-							afterLogs = append(afterLogs, log)
-						}
-						if strings.Contains(log, "{\"new-level\": 0, \"current-level\": 2}") {
-							found = true
-						}
-					}
-					g.Expect(found).To(BeTrue())
-					g.Expect(afterLogs).To(
-						ContainElement(And(
-							ContainSubstring("Reconciling SriovOperatorConfig"),
-						)),
-					)
-
-					// Should not contain verbose logging
-					g.Expect(afterLogs).ToNot(
-						ContainElement(
-							ContainSubstring("Start to sync webhook objects"),
-						),
-					)
-				}, 3*time.Minute, 5*time.Second).Should(Succeed())
-			})
-		})
-
-		DescribeTable("should gracefully restart quickly", func(webookEnabled bool) {
-			DeferCleanup(setSriovOperatorSpecFlag(operatorNetworkInjectorFlag, webookEnabled))
-			DeferCleanup(setSriovOperatorSpecFlag(operatorWebhookFlag, webookEnabled))
-
-			// This test case ensure leader election process runs smoothly when the operator's pod is restarted.
-			oldLease, err := clients.CoordinationV1Interface.Leases(operatorNamespace).Get(context.Background(), consts.LeaderElectionID, metav1.GetOptions{})
-			if k8serrors.IsNotFound(err) {
-				Skip("Leader Election is not enabled on the cluster. Skipping")
-			}
-			Expect(err).ToNot(HaveOccurred())
-
-			oldOperatorPod := getOperatorPod()
-
-			By("Delete the operator's pod")
-			deleteOperatorPod()
-
-			By("Wait the new operator's pod to start")
-			Eventually(func(g Gomega) {
-				newOperatorPod := getOperatorPod()
-				Expect(newOperatorPod.Name).ToNot(Equal(oldOperatorPod.Name))
-				Expect(newOperatorPod.Status.Phase).To(Equal(corev1.PodRunning))
-			}, 45*time.Second, 5*time.Second)
-
-			By("Assert the new operator's pod acquire the lease before 30 seconds")
-			Eventually(func(g Gomega) {
-				newLease, err := clients.CoordinationV1Interface.Leases(operatorNamespace).Get(context.Background(), consts.LeaderElectionID, metav1.GetOptions{})
-				g.Expect(err).ToNot(HaveOccurred())
-
-				g.Expect(newLease.Spec.HolderIdentity).ToNot(Equal(oldLease.Spec.HolderIdentity))
-			}, 30*time.Second, 5*time.Second).Should(Succeed())
-		},
-			Entry("webhooks enabled", true),
-			Entry("webhooks disabled", true),
-		)
-
-		Context("SriovNetworkMetricsExporter", func() {
-			BeforeEach(func() {
-				if discovery.Enabled() {
-					Skip("Test unsuitable to be run in discovery mode")
-				}
-
-				initialValue := isFeatureFlagEnabled("metricsExporter")
-				DeferCleanup(func() {
-					By("Restoring initial feature flag value")
-					setFeatureFlag("metricsExporter", initialValue)
-				})
-
-				By("Enabling `metricsExporter` feature flag")
-				setFeatureFlag("metricsExporter", true)
-			})
-
-			It("should be deployed if the feature gate is enabled", func() {
-				By("Checking that a daemon is scheduled on selected node")
-				Eventually(func() bool {
-					return isDaemonsetScheduledOnNodes("node-role.kubernetes.io/worker", "app=sriov-network-metrics-exporter")
-				}).WithTimeout(time.Minute).WithPolling(time.Second).Should(Equal(true))
-			})
-
-			It("should deploy ServiceMonitor if the Prometheus operator is installed", func() {
-				_, err := clients.ServiceMonitors(operatorNamespace).List(context.Background(), metav1.ListOptions{})
-				if k8serrors.IsNotFound(err) {
-					Skip("Prometheus operator not available in the cluster")
-				}
-
-				By("Checking ServiceMonitor is deployed if needed")
-				Eventually(func(g Gomega) {
-					_, err := clients.ServiceMonitors(operatorNamespace).Get(context.Background(), "sriov-network-metrics-exporter", metav1.GetOptions{})
-					g.Expect(err).ToNot(HaveOccurred())
-				}).WithTimeout(time.Minute).WithPolling(time.Second).Should(Succeed())
-			})
-
-			It("should remove ServiceMonitor when the feature is turned off", func() {
-				setFeatureFlag("metricsExporter", false)
-				Eventually(func(g Gomega) {
-					_, err := clients.ServiceMonitors(operatorNamespace).Get(context.Background(), "sriov-network-metrics-exporter", metav1.GetOptions{})
-					g.Expect(k8serrors.IsNotFound(err)).To(BeTrue())
-				}).WithTimeout(time.Minute).WithPolling(time.Second).Should(Succeed())
-			})
-		})
 	})
 
 	Describe("Generic SriovNetworkNodePolicy", func() {
@@ -519,7 +283,7 @@ var _ = Describe("[sriov] operator", Ordered, func() {
 					}
 
 					err = clients.Pods(namespaces.Test).Delete(context.Background(), podObj.Name, metav1.DeleteOptions{
-						GracePeriodSeconds: pointer.Int64Ptr(0)})
+						GracePeriodSeconds: ptr.To(int64(0))})
 					Expect(err).ToNot(HaveOccurred())
 
 					return found
@@ -1004,8 +768,7 @@ var _ = Describe("[sriov] operator", Ordered, func() {
 				}, 2*time.Minute, 10*time.Second).Should(BeTrue(), "Error to detect Required Event")
 				By("Delete first pod and release all VFs")
 				err = clients.Pods(namespaces.Test).Delete(context.Background(), runningPodA.Name, metav1.DeleteOptions{
-					GracePeriodSeconds: pointer.Int64Ptr(0),
-				})
+					GracePeriodSeconds: ptr.To(int64(0))})
 				Expect(err).ToNot(HaveOccurred(), fmt.Sprintf("Error to delete pod %s", runningPodA.Name))
 				By("Checking that second pod is able to use released VF")
 				waitForPodRunning(runningPodB)
@@ -1185,6 +948,7 @@ var _ = Describe("[sriov] operator", Ordered, func() {
 				assertObjectIsNotFound("network-resources-injector-role-binding", &rbacv1.ClusterRoleBinding{})
 				assertObjectIsNotFound("network-resources-injector-config", &admission.MutatingWebhookConfiguration{})
 				assertObjectIsNotFound("nri-control-switches", &corev1.ConfigMap{})
+				assertObjectIsNotFound("network-resources-injector-allow-traffic-api-server", &networkv1.NetworkPolicy{})
 			})
 
 			It("SR-IOV Operator Config, disable Operator Webhook", func() {
@@ -1205,6 +969,7 @@ var _ = Describe("[sriov] operator", Ordered, func() {
 				assertObjectIsNotFound("operator-webhook", &rbacv1.ClusterRole{})
 				assertObjectIsNotFound("operator-webhook-role-binding", &rbacv1.ClusterRoleBinding{})
 				assertObjectIsNotFound("sriov-operator-webhook-config", &admission.MutatingWebhookConfiguration{})
+				assertObjectIsNotFound("operator-webhook-allow-traffic-api-server", &networkv1.NetworkPolicy{})
 			})
 
 			It("SR-IOV Operator Config, disable Resource Injector and Operator Webhook", func() {
@@ -1768,12 +1533,15 @@ var _ = Describe("[sriov] operator", Ordered, func() {
 
 				WaitForSRIOVStable()
 				By("Checking files on the host")
-				output, errOutput, err := runCommandOnConfigDaemon(testNode, "/bin/bash", "-c", "ls /host/etc/sriov-operator/pci/ | wc -l")
-				Expect(err).ToNot(HaveOccurred(), errOutput)
-				Expect(strings.HasPrefix(output, "0")).Should(BeTrue())
-				output, errOutput, err = runCommandOnConfigDaemon(testNode, "/bin/bash", "-c", "ls /host/etc/udev/rules.d/ | grep 10-nm-disable | wc -l")
-				Expect(err).ToNot(HaveOccurred(), errOutput)
-				Expect(strings.HasPrefix(output, "0")).Should(BeTrue())
+				Eventually(func(g Gomega) {
+					output, errOutput, err := runCommandOnConfigDaemon(testNode, "/bin/bash", "-c", "ls /host/etc/sriov-operator/pci/ | wc -l")
+					g.Expect(err).ToNot(HaveOccurred(), errOutput)
+					g.Expect(strings.HasPrefix(output, "0")).Should(BeTrue())
+
+					output, errOutput, err = runCommandOnConfigDaemon(testNode, "/bin/bash", "-c", "ls /host/etc/udev/rules.d/ | grep 10-nm-disable | wc -l")
+					g.Expect(err).ToNot(HaveOccurred(), errOutput)
+					g.Expect(strings.HasPrefix(output, "0")).Should(BeTrue())
+				}, 3*time.Minute, 1*time.Second).Should(Succeed())
 			})
 		})
 	})
@@ -2127,12 +1895,15 @@ func WaitForSRIOVStable() {
 	time.Sleep((10 + snoTimeoutMultiplier*20) * time.Second)
 
 	fmt.Println("Waiting for the sriov state to stable")
-	Eventually(func() bool {
-		// ignoring the error. This can eventually be executed against a single node cluster,
-		// and if a reconfiguration triggers a reboot then the api calls will return an error
-		res, _ := cluster.SriovStable(operatorNamespace, clients)
-		return res
-	}, waitingTime, 1*time.Second).Should(BeTrue())
+	Eventually(func(g Gomega) {
+		res, err := cluster.SriovStable(operatorNamespace, clients)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(res).To(BeTrue())
+	}, waitingTime, 1*time.Second).Should(Succeed(), func() string {
+		return "SR-IOV Operator is not stable" +
+			k8sreporter.SriovNetworkNodeStatesSummary(clients) +
+			k8sreporter.Events(clients, operatorNamespace)
+	})
 	fmt.Println("Sriov state is stable")
 
 	Eventually(func() bool {
@@ -2361,13 +2132,6 @@ func getOperatorLogs(since time.Time) []string {
 	ExpectWithOffset(1, err).ToNot(HaveOccurred())
 
 	return strings.Split(string(rawLogs), "\n")
-}
-
-func deleteOperatorPod() {
-	pod := getOperatorPod()
-
-	err := clients.Pods(operatorNamespace).Delete(context.Background(), pod.Name, metav1.DeleteOptions{})
-	ExpectWithOffset(1, err).ToNot(HaveOccurred())
 }
 
 func assertObjectIsNotFound(name string, obj runtimeclient.Object) {

@@ -41,7 +41,7 @@ if [ $CLUSTER_TYPE == "openshift" ]; then
   # dockercfg password is in the form `<token>:password`. We need to trim the `<token>:` prefix
   pass=${pass#"<token>:"}
 
-  registry="default-route-openshift-image-registry.apps.${cluster_name}.${domain_name}"
+  registry=`kubectl -n openshift-image-registry get route --no-headers | awk '{print $2}'`
   podman login -u serviceaccount -p ${pass} $registry --tls-verify=false
 
   export ADMISSION_CONTROLLERS_ENABLED=true
@@ -53,7 +53,6 @@ if [ $CLUSTER_TYPE == "openshift" ]; then
   export CLUSTER_TYPE=openshift
   export DEV_MODE=TRUE
   export CLUSTER_HAS_EMULATED_PF=TRUE
-  export OPERATOR_LEADER_ELECTION_ENABLE=true
   export METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED=true
   export METRICS_EXPORTER_PROMETHEUS_DEPLOY_RULES=true
   export METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT=${METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT:-"prometheus-k8s"}
@@ -79,7 +78,6 @@ else
 fi
 
 export ADMISSION_CONTROLLERS_ENABLED=true
-export OPERATOR_LEADER_ELECTION_ENABLE=true
 export SKIP_VAR_SET=""
 export OPERATOR_NAMESPACE=$NAMESPACE
 export OPERATOR_EXEC=kubectl
@@ -103,6 +101,10 @@ if [ $CLUSTER_TYPE == "openshift" ]; then
   export SRIOV_NETWORK_OPERATOR_IMAGE="image-registry.openshift-image-registry.svc:5000/$NAMESPACE/sriov-network-operator:latest"
   export SRIOV_NETWORK_CONFIG_DAEMON_IMAGE="image-registry.openshift-image-registry.svc:5000/$NAMESPACE/sriov-network-config-daemon:latest"
   export SRIOV_NETWORK_WEBHOOK_IMAGE="image-registry.openshift-image-registry.svc:5000/$NAMESPACE/sriov-network-operator-webhook:latest"
+
+  echo "## apply CRDs"
+  kubectl apply -k $root/config/crd
+
   echo "## deploying SRIOV Network Operator"
   hack/deploy-setup.sh $NAMESPACE
 else

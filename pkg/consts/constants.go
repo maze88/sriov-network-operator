@@ -55,7 +55,6 @@ const (
 	ServiceAccount                     = "ServiceAccount"
 	DPConfigFileName                   = "config.json"
 	OVSHWOLMachineConfigNameSuffix     = "ovs-hw-offload"
-	LeaderElectionID                   = "a56def2a.openshift.io"
 
 	LinkTypeEthernet   = "ether"
 	LinkTypeInfiniband = "infiniband"
@@ -113,6 +112,8 @@ const (
 
 	MCPPauseAnnotationState = "sriovnetwork.openshift.io/state"
 	MCPPauseAnnotationTime  = "sriovnetwork.openshift.io/time"
+
+	OwnerRefAnnotation = "sriovnetwork.openshift.io/owner-ref"
 
 	// NodeStateKeepUntilAnnotation contains name of the "keep until time" annotation for SriovNetworkNodeState object.
 	// The "keep until time" specifies the earliest time at which the state object can be removed

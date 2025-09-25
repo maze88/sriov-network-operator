@@ -17,7 +17,8 @@
 
 set -xeo pipefail
 
-OCP_VERSION=${OCP_VERSION:-4.16.0}
+OCP_VERSION=${OCP_VERSION:-4.18}
+OCP_RELEASE_TYPE=${OCP_RELEASE_TYPE:-stable}
 cluster_name=${CLUSTER_NAME:-ocp-virt}
 domain_name=lab
 
@@ -68,6 +69,7 @@ kcli create network -c 192.168.123.0/24 ocp
 kcli create network -c 192.168.${virtual_router_id}.0/24 --nodhcp -i $cluster_name
 
 cat <<EOF > ./${cluster_name}-plan.yaml
+version: $OCP_RELEASE_TYPE
 tag: $OCP_VERSION
 ctlplane_memory: 32768
 worker_memory: 8192
@@ -205,7 +207,6 @@ export OPERATOR_EXEC=kubectl
 export CLUSTER_TYPE=openshift
 export DEV_MODE=TRUE
 export CLUSTER_HAS_EMULATED_PF=TRUE
-export OPERATOR_LEADER_ELECTION_ENABLE=true
 export METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED=true
 export METRICS_EXPORTER_PROMETHEUS_DEPLOY_RULES=true
 export METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT=${METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT:-"prometheus-k8s"}
@@ -232,7 +233,7 @@ DELAY_SECONDS=10
 retries=0
 until [ $retries -ge $MAX_RETRIES ]; do
   # wait for all the openshift cluster operators to be running
-  if [ $(kubectl get clusteroperator --no-headers | awk '{print $3}' | grep True | wc -l) -eq 33 ]; then
+  if [ $(kubectl get clusteroperator --no-headers | awk '{print $3}' | grep -v True | wc -l) -eq 0 ]; then
     break
   fi
   retries=$((retries+1))
@@ -292,7 +293,7 @@ podman rmi -fi ${SRIOV_NETWORK_WEBHOOK_IMAGE}
 podman logout $registry
 
 echo "## apply CRDs"
-kubectl apply -k $root/config/crd
+kubectl apply -f $root/config/crd/bases
 
 
 cat <<EOF | kubectl apply -f -

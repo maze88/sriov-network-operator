@@ -14,11 +14,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	sriovv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
 	testclient "github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/client"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/nodes"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/pod"
@@ -32,8 +33,8 @@ type EnabledNodes struct {
 }
 
 var (
-	supportedPFDrivers = []string{"mlx5_core", "i40e", "ixgbe", "ice", "igb"}
-	supportedVFDrivers = []string{"iavf", "vfio-pci", "mlx5_core", "igbvf"}
+	supportedPFDrivers = []string{"mlx5_core", "i40e", "ixgbe", "ice", "igb", "ena"}
+	supportedVFDrivers = []string{"iavf", "vfio-pci", "mlx5_core", "igbvf", "ena"}
 	mlxVendorID        = "15b3"
 	intelVendorID      = "8086"
 )
@@ -58,7 +59,8 @@ const NodeAndDeviceNameFilterEnvVar string = "SRIOV_NODE_AND_DEVICE_NAME_FILTER"
 
 // DiscoverSriov retrieves Sriov related information of a given cluster.
 func DiscoverSriov(clients *testclient.ClientSet, operatorNamespace string) (*EnabledNodes, error) {
-	nodeStates, err := clients.SriovNetworkNodeStates(operatorNamespace).List(context.Background(), metav1.ListOptions{})
+	nodeStates := &sriovv1.SriovNetworkNodeStateList{}
+	err := clients.List(context.Background(), nodeStates, &runtimeclient.ListOptions{Namespace: operatorNamespace})
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve note states %v", err)
 	}
@@ -153,6 +155,33 @@ func (n *EnabledNodes) FindSriovDevices(node string) ([]*sriovv1.InterfaceExt, e
 	return filteredDevices, nil
 }
 
+// FindSriovDevicesAndNode retrieves the node with the most number of SRIOV devices after filtering by `SRIOV_NODE_AND_DEVICE_NAME_FILTER` environment variable.
+func (n *EnabledNodes) FindSriovDevicesAndNode() (string, []*sriovv1.InterfaceExt, error) {
+	errs := []error{}
+
+	retNode := ""
+	retDevices := []*sriovv1.InterfaceExt{}
+
+	for _, node := range n.Nodes {
+		devices, err := n.FindSriovDevices(node)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		if len(devices) > len(retDevices) {
+			retNode = node
+			retDevices = devices
+		}
+	}
+
+	if len(retDevices) == 0 {
+		return "", nil, fmt.Errorf("can't find any SR-IOV devices in cluster's nodes: %w", errors.Join(errs...))
+	}
+
+	return retNode, retDevices, nil
+}
+
 // FindSriovDevicesIgnoreFilters retrieves all valid sriov devices for the given node.
 func (n *EnabledNodes) FindSriovDevicesIgnoreFilters(node string) ([]*sriovv1.InterfaceExt, error) {
 	devices := []*sriovv1.InterfaceExt{}
@@ -203,9 +232,14 @@ func (n *EnabledNodes) FindOneSriovNodeAndDevice() (string, *sriovv1.InterfaceEx
 // FindOneVfioSriovDevice retrieves a node with a valid sriov device for vfio
 func (n *EnabledNodes) FindOneVfioSriovDevice() (string, sriovv1.InterfaceExt) {
 	for _, node := range n.Nodes {
-		for _, nic := range n.States[node].Status.Interfaces {
+		devices, err := n.FindSriovDevices(node)
+		if err != nil {
+			return "", sriovv1.InterfaceExt{}
+		}
+
+		for _, nic := range devices {
 			if nic.Vendor == intelVendorID && sriovv1.IsSupportedModel(nic.Vendor, nic.DeviceID) && nic.TotalVfs != 0 {
-				return node, nic
+				return node, *nic
 			}
 		}
 	}
@@ -214,29 +248,30 @@ func (n *EnabledNodes) FindOneVfioSriovDevice() (string, sriovv1.InterfaceExt) {
 
 // FindOneMellanoxSriovDevice retrieves a valid sriov device for the given node.
 func (n *EnabledNodes) FindOneMellanoxSriovDevice(node string) (*sriovv1.InterfaceExt, error) {
-	s, ok := n.States[node]
-	if !ok {
-		return nil, fmt.Errorf("node %s not found", node)
-	}
-
 	// return error here as mlx interfaces are not supported when secure boot is enabled
 	// TODO: remove this when mlx support secure boot/lockdown mode
 	if n.IsSecureBootEnabled[node] {
 		return nil, fmt.Errorf("secure boot is enabled on the node mellanox cards are not supported")
 	}
 
-	for _, itf := range s.Status.Interfaces {
-		if itf.Vendor == mlxVendorID && sriovv1.IsSupportedModel(itf.Vendor, itf.DeviceID) {
-			return &itf, nil
+	devices, err := n.FindSriovDevices(node)
+	if err != nil {
+		return nil, fmt.Errorf("unable to find a mellanox sriov devices in node %s: %w", node, err)
+	}
+
+	for _, nic := range devices {
+		if nic.Vendor == mlxVendorID && sriovv1.IsSupportedModel(nic.Vendor, nic.DeviceID) {
+			return nic, nil
 		}
 	}
 
-	return nil, fmt.Errorf("unable to find a mellanox sriov devices in node %s", node)
+	return nil, fmt.Errorf("no Mellanox devices found in node %s. Available devices [%+v]", node, devices)
 }
 
 // SriovStable tells if all the node states are in sync (and the cluster is ready for another round of tests)
 func SriovStable(operatorNamespace string, clients *testclient.ClientSet) (bool, error) {
-	nodeStates, err := clients.SriovNetworkNodeStates(operatorNamespace).List(context.Background(), metav1.ListOptions{})
+	nodeStates := &sriovv1.SriovNetworkNodeStateList{}
+	err := clients.List(context.Background(), nodeStates, &runtimeclient.ListOptions{Namespace: operatorNamespace})
 	switch err {
 	case io.ErrUnexpectedEOF:
 		return false, err
@@ -337,6 +372,31 @@ func SetDisableNodeDrainState(clients *testclient.ClientSet, operatorNamespace s
 }
 
 func GetNodeSecureBootState(clients *testclient.ClientSet, nodeName, namespace string) (bool, error) {
+	runningPod, err := createPodOnNode(clients, nodeName, namespace)
+	if err != nil {
+		return false, fmt.Errorf("failed to create pod on node %s: %w", nodeName, err)
+	}
+	defer func() {
+		err = clients.Pods(namespace).Delete(context.Background(), runningPod.Name, metav1.DeleteOptions{GracePeriodSeconds: ptr.To(int64(0))})
+		if err != nil {
+			err = fmt.Errorf("failed to remove the check secure boot status pod for node %s: %w", nodeName, err)
+		}
+	}()
+
+	stdout, stderr, err := pod.ExecCommand(clients, runningPod, "cat", "/host/sys/kernel/security/lockdown")
+
+	if strings.Contains(stderr, "No such file or directory") {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("secureboot check error stdout:[%s] stderr:[%s]: %w", stdout, stderr, err)
+	}
+
+	return strings.Contains(stdout, "[integrity]") || strings.Contains(stdout, "[confidentiality]"), nil
+}
+
+// createPodOnNode creates a pod on the given node with privileged capabilities host network and host path mounted
+func createPodOnNode(clients *testclient.ClientSet, nodeName, namespace string) (*corev1.Pod, error) {
 	podDefinition := pod.GetDefinition()
 	podDefinition = pod.RedefineWithNodeSelector(podDefinition, nodeName)
 	podDefinition = pod.RedefineAsPrivileged(podDefinition)
@@ -344,22 +404,15 @@ func GetNodeSecureBootState(clients *testclient.ClientSet, nodeName, namespace s
 
 	volume := corev1.Volume{Name: "host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/"}}}
 	mount := corev1.VolumeMount{Name: "host", MountPath: consts.Host}
-	podDefinition = pod.RedefineWithMount(podDefinition, volume, mount)
+	podDefinition = pod.RedefineWithHostNetwork(pod.RedefineWithMount(podDefinition, volume, mount))
 	created, err := clients.Pods(namespace).Create(context.Background(), podDefinition, metav1.CreateOptions{})
 	if err != nil {
-		return false, err
+		return nil, fmt.Errorf("failed to create pod on node %s: %w", nodeName, err)
 	}
 
-	defer func() {
-		err = clients.Pods(namespace).Delete(context.Background(), created.Name, metav1.DeleteOptions{GracePeriodSeconds: pointer.Int64Ptr(0)})
-		if err != nil {
-			err = fmt.Errorf("failed to remove the check secure boot status pod for node %s: %v", nodeName, err)
-		}
-	}()
-
 	var runningPod *corev1.Pod
-	err = wait.PollImmediate(time.Second, 3*time.Minute, func() (bool, error) {
-		runningPod, err = clients.Pods(namespace).Get(context.Background(), created.Name, metav1.GetOptions{})
+	err = wait.PollUntilContextTimeout(context.Background(), time.Second, 3*time.Minute, true, func(ctx context.Context) (bool, error) {
+		runningPod, err = clients.Pods(namespace).Get(ctx, created.Name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -371,19 +424,9 @@ func GetNodeSecureBootState(clients *testclient.ClientSet, nodeName, namespace s
 		return true, nil
 	})
 	if err != nil {
-		return false, err
+		return nil, fmt.Errorf("failed pod is not running on node %s: %w", nodeName, err)
 	}
-
-	stdout, _, err := pod.ExecCommand(clients, runningPod, "cat", "/host/sys/kernel/security/lockdown")
-
-	if strings.Contains(stdout, "No such file or directory") {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-
-	return strings.Contains(stdout, "[integrity]") || strings.Contains(stdout, "[confidentiality]"), nil
+	return runningPod, nil
 }
 
 func VirtualCluster() bool {
@@ -391,4 +434,97 @@ func VirtualCluster() bool {
 		return true
 	}
 	return false
+}
+
+// DiscoverSriovForAws discovers sriov nodes for AWS platform
+// In this case we must filter out the nics that are connected to the ovs bridge
+// so we don't use move them into the container and lose connectivity to the host
+func DiscoverSriovForAws(clients *testclient.ClientSet, operatorNamespace string) (*EnabledNodes, error) {
+	// Discover sriov nodes
+	tmpEnabledNodes, err := DiscoverSriov(clients, operatorNamespace)
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover sriov nodes: %w", err)
+	}
+
+	res := &EnabledNodes{}
+	res.States = make(map[string]sriovv1.SriovNetworkNodeState)
+	res.Nodes = make([]string, 0)
+	res.IsSecureBootEnabled = make(map[string]bool)
+
+	for _, node := range tmpEnabledNodes.Nodes {
+		// Get the ovs bridge connected nics so we can filter out the nics that are connected to the ovs bridge
+		ovsBridgeConnectedNicsMap, err := getOvsBridgeConnectedNics(clients, node, operatorNamespace)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get ovs bridge connected nics on node %s: %w", node, err)
+		}
+
+		ifaceList := sriovv1.InterfaceExts{}
+		for _, nic := range tmpEnabledNodes.States[node].Status.Interfaces {
+			// If the nic is not connected to the ovs bridge, add it to the list
+			if !ovsBridgeConnectedNicsMap[nic.Name] {
+				ifaceList = append(ifaceList, nic)
+			}
+		}
+		// If there are any nics that are not connected to the ovs bridge, add the node to the result
+		if len(ifaceList) > 0 {
+			res.Nodes = append(res.Nodes, node)
+			nodeState := tmpEnabledNodes.States[node]
+			nodeState.Status.Interfaces = ifaceList
+			res.States[node] = nodeState
+			res.IsSecureBootEnabled[node] = tmpEnabledNodes.IsSecureBootEnabled[node]
+		}
+	}
+	return res, nil
+}
+
+func getOvsBridgeConnectedNics(clients *testclient.ClientSet, nodeName, operatorNamespace string) (map[string]bool, error) {
+	runningPod, err := createPodOnNode(clients, nodeName, operatorNamespace)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pod on node %s: %w", nodeName, err)
+	}
+	defer func() {
+		err = clients.Pods(operatorNamespace).Delete(context.Background(), runningPod.Name, metav1.DeleteOptions{GracePeriodSeconds: ptr.To(int64(0))})
+		if err != nil {
+			err = fmt.Errorf("failed to remove the check ovs bridge connected nics pod for node %s: %w", nodeName, err)
+		}
+	}()
+
+	stdout, stderr, err := pod.ExecCommand(clients, runningPod, "sh", "-c", "ip l | grep \"master ovs-system\" | grep -v \"@\" | awk '{print $2}' | tr -d ':'")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ovs bridge connected nics on node %s: stdout:[%s] stderr:[%s]: %w", nodeName, stdout, stderr, err)
+	}
+	ifaceMap := make(map[string]bool)
+	ifaceList := strings.Split(stdout, "\n")
+	for _, iface := range ifaceList {
+		if iface != "" {
+			ifaceMap[iface] = true
+		}
+	}
+	return ifaceMap, nil
+}
+
+// GetPlatformType retrieves the platform type of the cluster
+// all the nodes in the selector must have the same platform type we only return the first one found
+func GetPlatformType(clients *testclient.ClientSet, operatorNamespace string) (consts.PlatformTypes, error) {
+	nodeStates := &sriovv1.SriovNetworkNodeStateList{}
+	err := clients.List(context.Background(), nodeStates, &runtimeclient.ListOptions{Namespace: operatorNamespace})
+	if err != nil {
+		return consts.Baremetal, fmt.Errorf("failed to retrieve note states %v", err)
+	}
+
+	ss, err := nodes.MatchingOptionalSelectorState(clients, nodeStates.Items)
+	if err != nil {
+		return consts.Baremetal, fmt.Errorf("failed to find matching node states %v", err)
+	}
+	if len(ss) == 0 {
+		return consts.Baremetal, fmt.Errorf("no nodes found in the selector")
+	}
+
+	nodeObj := &corev1.Node{}
+	err = clients.Get(context.Background(), runtimeclient.ObjectKey{Name: ss[0].Name}, nodeObj)
+	if err != nil {
+		return consts.Baremetal, fmt.Errorf("failed to get node %s %v", ss[0].Name, err)
+	}
+
+	return vars.GetPlatformType(nodeObj.Spec.ProviderID), nil
 }

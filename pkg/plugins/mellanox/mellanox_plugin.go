@@ -6,19 +6,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/helper"
 	plugin "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/plugins"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
 	mlx "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vendors/mellanox"
 )
 
 var PluginName = "mellanox"
 
 type MellanoxPlugin struct {
-	PluginName  string
-	SpecVersion string
-	helpers     helper.HostHelpersInterface
+	PluginName string
+	helpers    helper.HostHelpersInterface
 }
 
+var pciAddressesToReset []string
 var attributesToChange map[string]mlx.MlxNic
 var mellanoxNicsStatus map[string]map[string]sriovnetworkv1.InterfaceExt
 var mellanoxNicsSpec map[string]sriovnetworkv1.Interface
@@ -28,20 +30,14 @@ func NewMellanoxPlugin(helpers helper.HostHelpersInterface) (plugin.VendorPlugin
 	mellanoxNicsStatus = map[string]map[string]sriovnetworkv1.InterfaceExt{}
 
 	return &MellanoxPlugin{
-		PluginName:  PluginName,
-		SpecVersion: "1.0",
-		helpers:     helpers,
+		PluginName: PluginName,
+		helpers:    helpers,
 	}, nil
 }
 
 // Name returns the name of the plugin
 func (p *MellanoxPlugin) Name() string {
 	return p.PluginName
-}
-
-// SpecVersion returns the version of the spec expected by the plugin
-func (p *MellanoxPlugin) Spec() string {
-	return p.SpecVersion
 }
 
 // OnNodeStateChange Invoked when SriovNetworkNodeState CR is created or updated, return if need dain and/or reboot node
@@ -51,6 +47,7 @@ func (p *MellanoxPlugin) OnNodeStateChange(new *sriovnetworkv1.SriovNetworkNodeS
 	needDrain = false
 	needReboot = false
 	err = nil
+	pciAddressesToReset = []string{}
 	attributesToChange = map[string]mlx.MlxNic{}
 	mellanoxNicsStatus = map[string]map[string]sriovnetworkv1.InterfaceExt{}
 	mellanoxNicsSpec = map[string]sriovnetworkv1.Interface{}
@@ -131,6 +128,10 @@ func (p *MellanoxPlugin) OnNodeStateChange(new *sriovnetworkv1.SriovNetworkNodeS
 		if needReboot || changeWithoutReboot {
 			attributesToChange[ifaceSpec.PciAddress] = *attrs
 		}
+
+		if needReboot {
+			pciAddressesToReset = append(pciAddressesToReset, ifaceSpec.PciAddress)
+		}
 	}
 
 	// Set total VFs to 0 for mellanox interfaces with no spec
@@ -143,8 +144,25 @@ func (p *MellanoxPlugin) OnNodeStateChange(new *sriovnetworkv1.SriovNetworkNodeS
 		processedNics[pciPrefix] = true
 		pciAddress := pciPrefix + "0"
 
+		// Skip devices not configured by the operator
+		isConfigured, err := p.nicConfiguredByOperator(portsMap)
+		if err != nil {
+			return false, false, err
+		}
+		if !isConfigured {
+			log.Log.V(2).Info("None of the ports are configured by the operator skipping firmware reset",
+				"portMap", portsMap)
+			continue
+		}
+
 		// Skip externally managed NICs
-		if p.nicHasExternallyManagedPFs(portsMap) {
+		hasExternally, err := p.nicHasExternallyManagedPFs(portsMap)
+		if err != nil {
+			return false, false, err
+		}
+		if hasExternally {
+			log.Log.V(2).Info("One of the ports is configured as externally managed skipping firmware reset",
+				"portMap", portsMap)
 			continue
 		}
 
@@ -184,25 +202,56 @@ func (p *MellanoxPlugin) Apply() error {
 		return nil
 	}
 	log.Log.Info("mellanox plugin Apply()")
-	return p.helpers.MlxConfigFW(attributesToChange)
+	if err := p.helpers.MlxConfigFW(attributesToChange); err != nil {
+		return err
+	}
+	if vars.FeatureGate.IsEnabled(consts.MellanoxFirmwareResetFeatureGate) {
+		return p.helpers.MlxResetFW(pciAddressesToReset, mellanoxNicsStatus)
+	}
+	return nil
 }
 
 // nicHasExternallyManagedPFs returns true if one of the ports(interface) of the NIC is marked as externally managed
 // in StoreManagerInterface.
-func (p *MellanoxPlugin) nicHasExternallyManagedPFs(nicPortsMap map[string]sriovnetworkv1.InterfaceExt) bool {
+func (p *MellanoxPlugin) nicHasExternallyManagedPFs(nicPortsMap map[string]sriovnetworkv1.InterfaceExt) (bool, error) {
 	for _, iface := range nicPortsMap {
 		pfStatus, exist, err := p.helpers.LoadPfsStatus(iface.PciAddress)
 		if err != nil {
-			log.Log.Error(err, "failed to load PF status from disk", "address", iface.PciAddress)
-			continue
+			// nolint:goconst
+			log.Log.Error(err, "failed to load PF status from disk. "+
+				"This should not happen, to overcome config daemon stuck, "+
+				"please remove the PCI file on the host under the operator configuration path",
+				"path", consts.PfAppliedConfig, "pciAddress", iface.PciAddress)
+			return false, err
 		}
 		if !exist {
 			continue
 		}
 		if pfStatus.ExternallyManaged {
 			log.Log.V(2).Info("PF is extenally managed, skip FW TotalVfs reset")
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
+}
+
+// nicConfiguredByOperator returns true if one of the ports(interface) of the NIC is configured by operator
+func (p *MellanoxPlugin) nicConfiguredByOperator(nicPortsMap map[string]sriovnetworkv1.InterfaceExt) (bool, error) {
+	for _, iface := range nicPortsMap {
+		_, exist, err := p.helpers.LoadPfsStatus(iface.PciAddress)
+		if err != nil {
+			// nolint:goconst
+			log.Log.Error(err, "failed to load PF status from disk. "+
+				"This should not happen, to overcome config daemon stuck, "+
+				"please remove the PCI file on the host under the operator configuration path",
+				"path", consts.PfAppliedConfig, "pciAddress", iface.PciAddress)
+			return false, err
+		}
+		if exist {
+			log.Log.V(2).Info("PF configured by the operator", "interface", iface)
+			return true, nil
+		}
+	}
+
+	return false, nil
 }

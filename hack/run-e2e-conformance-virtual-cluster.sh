@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 set -xeo pipefail
 
-cluster_version=${CLUSTER_VERSION:-1.29.3}
+cluster_version=${CLUSTER_VERSION:-1.34.2}
 cluster_name=${CLUSTER_NAME:-virtual}
 domain_name=$cluster_name.lab
 
 api_ip=${API_IP:-192.168.124.250}
 virtual_router_id=${VIRTUAL_ROUTER_ID:-250}
-HOME="/root"
 
 here="$(dirname "$(readlink --canonicalize "${BASH_SOURCE[0]}")")"
 root="$(readlink --canonicalize "$here/..")"
 
 NUM_OF_WORKERS=${NUM_OF_WORKERS:-2}
 total_number_of_nodes=$((1 + NUM_OF_WORKERS))
+
+## Global configuration
+export NAMESPACE="sriov-network-operator"
+export OPERATOR_NAMESPACE="sriov-network-operator"
+export SKIP_VAR_SET=""
+export OPERATOR_EXEC=kubectl
+export CLUSTER_HAS_EMULATED_PF=TRUE
 
 if [ "$NUM_OF_WORKERS" -lt 2 ]; then
     echo "Min number of workers is 2"
@@ -43,6 +49,7 @@ kcli delete network $cluster_name -y
 function cleanup {
   kcli delete cluster $cluster_name -y
   kcli delete network $cluster_name -y
+  sudo rm -f /etc/containers/registries.conf.d/003-${cluster_name}.conf
 }
 
 if [ -z $SKIP_DELETE ]; then
@@ -147,9 +154,10 @@ insecure = true
 \"golang\" = \"docker.io/library/golang\"
 "
 
-cat << EOF > /etc/containers/registries.conf.d/003-${cluster_name}.conf
+sudo bash -c "cat << EOF > /etc/containers/registries.conf.d/003-${cluster_name}.conf
 $insecure_registry
 EOF
+"
 
 function update_host() {
     node_name=$1
@@ -188,6 +196,22 @@ WantedBy=default.target' > /etc/systemd/system/disable-offload.service
 
 systemctl daemon-reload
 systemctl enable --now disable-offload
+
+echo '[Unit]
+Description=load br_netfilter
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash -c "modprobe br_netfilter"
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=default.target' > /etc/systemd/system/load-br-netfilter.service
+
+systemctl daemon-reload
+systemctl enable --now load-br-netfilter
 
 systemctl restart NetworkManager
 
@@ -364,36 +388,8 @@ do
     ATTEMPTS=$((ATTEMPTS+1))
 done
 
-
-source hack/env.sh
-
-export ADMISSION_CONTROLLERS_ENABLED=true
-export ADMISSION_CONTROLLERS_CERTIFICATES_CERT_MANAGER_ENABLED=true
-export SKIP_VAR_SET=""
-export NAMESPACE="sriov-network-operator"
-export OPERATOR_NAMESPACE="sriov-network-operator"
-export CNI_BIN_PATH=/opt/cni/bin
-export OPERATOR_EXEC=kubectl
-export CLUSTER_HAS_EMULATED_PF=TRUE
-
-
-HELM_VALUES_OPTS="\
-  --set images.operator=${SRIOV_NETWORK_OPERATOR_IMAGE} \
-  --set images.sriovConfigDaemon=${SRIOV_NETWORK_CONFIG_DAEMON_IMAGE} \
-  --set images.sriovCni=${SRIOV_CNI_IMAGE} \
-  --set images.sriovDevicePlugin=${SRIOV_DEVICE_PLUGIN_IMAGE} \
-  --set images.resourcesInjector=${NETWORK_RESOURCES_INJECTOR_IMAGE} \
-  --set images.webhook=${SRIOV_NETWORK_WEBHOOK_IMAGE} \
-  --set operator.admissionControllers.enabled=${ADMISSION_CONTROLLERS_ENABLED} \
-  --set operator.admissionControllers.certificates.certManager.enabled=${ADMISSION_CONTROLLERS_CERTIFICATES_CERT_MANAGER_ENABLED} \
-  --set sriovOperatorConfig.deploy=true"
-
-PATH=$PATH:${root}/bin
-make helm
-helm  install -n ${NAMESPACE} --create-namespace \
-  $HELM_VALUES_OPTS \
-  --wait sriov-network-operator ./deployment/sriov-network-operator-chart
-
+# Deploy the sriov operator via helm
+hack/deploy-operator-helm.sh
 
 echo "## create certificates for webhook"
 cat <<EOF | kubectl apply -f -

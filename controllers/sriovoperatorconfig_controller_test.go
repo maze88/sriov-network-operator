@@ -2,31 +2,34 @@ package controllers
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
-	admv1 "k8s.io/api/admissionregistration/v1"
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
-
-	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"go.uber.org/mock/gomock"
+	admv1 "k8s.io/api/admissionregistration/v1"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
-	constants "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/featuregate"
-	mock_platforms "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/platforms/mock"
-	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/platforms/openshift"
+	orchestratorMock "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/orchestrator/mock"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
-	util "github.com/k8snetworkplumbingwg/sriov-network-operator/test/util"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util"
 )
 
 var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
@@ -35,20 +38,8 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 
 	BeforeAll(func() {
 		By("Create SriovOperatorConfig controller k8s objs")
-		config := &sriovnetworkv1.SriovOperatorConfig{}
-		config.SetNamespace(testNamespace)
-		config.SetName(constants.DefaultConfigName)
-		config.Spec = sriovnetworkv1.SriovOperatorConfigSpec{
-			EnableInjector:           true,
-			EnableOperatorWebhook:    true,
-			ConfigDaemonNodeSelector: map[string]string{},
-			LogLevel:                 2,
-		}
+		config := makeDefaultSriovOpConfig()
 		Expect(k8sClient.Create(context.Background(), config)).Should(Succeed())
-		DeferCleanup(func() {
-			err := k8sClient.Delete(context.Background(), config)
-			Expect(err).ToNot(HaveOccurred())
-		})
 
 		somePolicy := &sriovnetworkv1.SriovNetworkNodePolicy{}
 		somePolicy.SetNamespace(testNamespace)
@@ -60,10 +51,6 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 			Priority:     20,
 		}
 		Expect(k8sClient.Create(context.Background(), somePolicy)).ToNot(HaveOccurred())
-		DeferCleanup(func() {
-			err := k8sClient.Delete(context.Background(), somePolicy)
-			Expect(err).ToNot(HaveOccurred())
-		})
 
 		// setup controller manager
 		By("Setup controller manager")
@@ -72,16 +59,24 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 
 		t := GinkgoT()
 		mockCtrl := gomock.NewController(t)
-		platformHelper := mock_platforms.NewMockInterface(mockCtrl)
-		platformHelper.EXPECT().GetFlavor().Return(openshift.OpenshiftFlavorDefault).AnyTimes()
-		platformHelper.EXPECT().IsOpenshiftCluster().Return(false).AnyTimes()
-		platformHelper.EXPECT().IsHypershift().Return(false).AnyTimes()
+		orchestrator := orchestratorMock.NewMockInterface(mockCtrl)
+
+		orchestrator.EXPECT().ClusterType().DoAndReturn(func() consts.ClusterType {
+			if vars.ClusterType == consts.ClusterTypeOpenshift {
+				return consts.ClusterTypeOpenshift
+			}
+			return consts.ClusterTypeKubernetes
+		}).AnyTimes()
+
+		// TODO: Change this to add tests for hypershift
+		orchestrator.EXPECT().Flavor().Return(consts.ClusterFlavorDefault).AnyTimes()
 
 		err = (&SriovOperatorConfigReconciler{
-			Client:         k8sManager.GetClient(),
-			Scheme:         k8sManager.GetScheme(),
-			PlatformHelper: platformHelper,
-			FeatureGate:    featuregate.New(),
+			Client:            k8sManager.GetClient(),
+			Scheme:            k8sManager.GetScheme(),
+			Orchestrator:      orchestrator,
+			FeatureGate:       featuregate.New(),
+			UncachedAPIReader: k8sManager.GetAPIReader(),
 		}).SetupWithManager(k8sManager)
 		Expect(err).ToNot(HaveOccurred())
 
@@ -105,18 +100,47 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 	})
 
 	Context("When is up", func() {
-		JustBeforeEach(func() {
+		AfterAll(func() {
+			err := k8sClient.DeleteAllOf(context.Background(), &corev1.Node{})
+			Expect(err).ToNot(HaveOccurred())
+
+			err = k8sClient.DeleteAllOf(context.Background(), &sriovnetworkv1.SriovNetworkNodePolicy{}, client.InNamespace(vars.Namespace))
+			Expect(err).ToNot(HaveOccurred())
+
+			err = k8sClient.DeleteAllOf(context.Background(), &sriovnetworkv1.SriovNetworkNodeState{}, client.InNamespace(vars.Namespace))
+			Expect(err).ToNot(HaveOccurred())
+
+			err = k8sClient.DeleteAllOf(context.Background(), &sriovnetworkv1.SriovOperatorConfig{}, client.InNamespace(vars.Namespace))
+			Expect(err).ToNot(HaveOccurred())
+
+			operatorConfigList := &sriovnetworkv1.SriovOperatorConfigList{}
+			Eventually(func(g Gomega) {
+				err = k8sClient.List(context.Background(), operatorConfigList, &client.ListOptions{Namespace: vars.Namespace})
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(len(operatorConfigList.Items)).To(Equal(0))
+			}, time.Minute, time.Second).Should(Succeed())
+		})
+
+		BeforeEach(func() {
+			var err error
 			config := &sriovnetworkv1.SriovOperatorConfig{}
-			err := util.WaitForNamespacedObject(config, k8sClient, testNamespace, "default", util.RetryInterval, util.APITimeout)
-			Expect(err).NotTo(HaveOccurred())
-			config.Spec = sriovnetworkv1.SriovOperatorConfigSpec{
-				EnableInjector:        true,
-				EnableOperatorWebhook: true,
-				LogLevel:              2,
-				FeatureGates:          map[string]bool{},
-			}
-			err = k8sClient.Update(ctx, config)
-			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func(g Gomega) {
+				err = util.WaitForNamespacedObject(config, k8sClient, testNamespace, "default", util.RetryInterval, util.APITimeout)
+				g.Expect(err).NotTo(HaveOccurred())
+				// in case controller yet to add object's finalizer (e.g whenever test deferCleanup is creating new 'default' config object)
+				g.Expect(config.Finalizers).ToNot(BeEmpty())
+
+				config.Spec = sriovnetworkv1.SriovOperatorConfigSpec{
+					EnableInjector:        true,
+					EnableOperatorWebhook: true,
+					LogLevel:              2,
+					FeatureGates:          map[string]bool{},
+				}
+				err = k8sClient.Update(ctx, config)
+				Expect(err).NotTo(HaveOccurred())
+			}).Should(Succeed())
+
 		})
 
 		It("should have webhook enable", func() {
@@ -158,6 +182,10 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 			err = util.WaitForNamespacedObjectDeleted(daemonSet, k8sClient, testNamespace, "network-resources-injector", util.RetryInterval, util.APITimeout)
 			Expect(err).NotTo(HaveOccurred())
 
+			networkPolicy := &networkv1.NetworkPolicy{}
+			err = util.WaitForNamespacedObjectDeleted(networkPolicy, k8sClient, testNamespace, "network-resources-injector-allow-traffic-api-server", util.RetryInterval, util.APITimeout)
+			Expect(err).NotTo(HaveOccurred())
+
 			mutateCfg := &admv1.MutatingWebhookConfiguration{}
 			err = util.WaitForNamespacedObjectDeleted(mutateCfg, k8sClient, testNamespace, "network-resources-injector-config", util.RetryInterval, util.APITimeout)
 			Expect(err).NotTo(HaveOccurred())
@@ -172,6 +200,10 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 
 			daemonSet = &appsv1.DaemonSet{}
 			err = util.WaitForNamespacedObject(daemonSet, k8sClient, testNamespace, "network-resources-injector", util.RetryInterval, util.APITimeout)
+			Expect(err).NotTo(HaveOccurred())
+
+			networkPolicy = &networkv1.NetworkPolicy{}
+			err = util.WaitForNamespacedObject(networkPolicy, k8sClient, testNamespace, "network-resources-injector-allow-traffic-api-server", util.RetryInterval, util.APITimeout)
 			Expect(err).NotTo(HaveOccurred())
 
 			mutateCfg = &admv1.MutatingWebhookConfiguration{}
@@ -193,6 +225,10 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 			err = util.WaitForNamespacedObjectDeleted(daemonSet, k8sClient, testNamespace, "operator-webhook", util.RetryInterval, util.APITimeout)
 			Expect(err).NotTo(HaveOccurred())
 
+			networkPolicy := &networkv1.NetworkPolicy{}
+			err = util.WaitForNamespacedObjectDeleted(networkPolicy, k8sClient, testNamespace, "operator-webhook-allow-traffic-api-server", util.RetryInterval, util.APITimeout)
+			Expect(err).NotTo(HaveOccurred())
+
 			mutateCfg := &admv1.MutatingWebhookConfiguration{}
 			err = util.WaitForNamespacedObjectDeleted(mutateCfg, k8sClient, testNamespace, "sriov-operator-webhook-config", util.RetryInterval, util.APITimeout)
 			Expect(err).NotTo(HaveOccurred())
@@ -201,7 +237,7 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 			err = util.WaitForNamespacedObjectDeleted(validateCfg, k8sClient, testNamespace, "sriov-operator-webhook-config", util.RetryInterval, util.APITimeout)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("set disable to enableOperatorWebhook")
+			By("set enable to enableOperatorWebhook")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: "default"}, config)).NotTo(HaveOccurred())
 
 			config.Spec.EnableOperatorWebhook = true
@@ -210,6 +246,10 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 
 			daemonSet = &appsv1.DaemonSet{}
 			err = util.WaitForNamespacedObject(daemonSet, k8sClient, testNamespace, "operator-webhook", util.RetryInterval, util.APITimeout)
+			Expect(err).NotTo(HaveOccurred())
+
+			networkPolicy = &networkv1.NetworkPolicy{}
+			err = util.WaitForNamespacedObject(networkPolicy, k8sClient, testNamespace, "operator-webhook-allow-traffic-api-server", util.RetryInterval, util.APITimeout)
 			Expect(err).NotTo(HaveOccurred())
 
 			mutateCfg = &admv1.MutatingWebhookConfiguration{}
@@ -221,36 +261,151 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
+		// Namespaced resources are deleted via the `.ObjectMeta.OwnerReference` field. That logic can't be tested here because testenv doesn't have built-in controllers
+		// (See https://book.kubebuilder.io/reference/envtest#testing-considerations). Since Service and DaemonSet are deleted when default/SriovOperatorConfig is no longer
+		// present, it's important that webhook configurations are deleted as well.
+		It("should delete the webhooks when SriovOperatorConfig/default is deleted", func() {
+			DeferCleanup(k8sClient.Create, context.Background(), makeDefaultSriovOpConfig())
+
+			err := k8sClient.Delete(context.Background(), &sriovnetworkv1.SriovOperatorConfig{
+				ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			assertResourceDoesNotExist(
+				schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Kind: "MutatingWebhookConfiguration", Version: "v1"},
+				client.ObjectKey{Name: "sriov-operator-webhook-config"})
+			assertResourceDoesNotExist(
+				schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Kind: "ValidatingWebhookConfiguration", Version: "v1"},
+				client.ObjectKey{Name: "sriov-operator-webhook-config"})
+
+			assertResourceDoesNotExist(
+				schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Kind: "MutatingWebhookConfiguration", Version: "v1"},
+				client.ObjectKey{Name: "network-resources-injector-config"})
+		})
+
+		It("should add/delete finalizer 'operatorconfig' when SriovOperatorConfig/default is added/deleted", func() {
+			DeferCleanup(k8sClient.Create, context.Background(), makeDefaultSriovOpConfig())
+
+			// verify that finalizer has been added upon object creation
+			config := &sriovnetworkv1.SriovOperatorConfig{}
+			Eventually(func() []string {
+				// wait for SriovOperatorConfig flags to get updated
+				err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "default", Namespace: testNamespace}, config)
+				if err != nil {
+					return nil
+				}
+				return config.Finalizers
+			}, util.APITimeout, util.RetryInterval).Should(Equal([]string{sriovnetworkv1.OPERATORCONFIGFINALIZERNAME}))
+
+			err := k8sClient.Delete(context.Background(), &sriovnetworkv1.SriovOperatorConfig{
+				ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// verify that finalizer has been removed
+			var empty []string
+			config = &sriovnetworkv1.SriovOperatorConfig{}
+			Eventually(func() []string {
+				// wait for SriovOperatorConfig flags to get updated
+				err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "default", Namespace: testNamespace}, config)
+				if err != nil {
+					return nil
+				}
+				return config.Finalizers
+			}, util.APITimeout, util.RetryInterval).Should(Equal(empty))
+		})
+
+		It("should not remove fields with default values when SriovOperatorConfig is created", func() {
+			err := k8sClient.Delete(context.Background(), &sriovnetworkv1.SriovOperatorConfig{
+				ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: consts.DefaultConfigName},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			config := &unstructured.Unstructured{}
+			config.SetGroupVersionKind(sriovnetworkv1.GroupVersion.WithKind("SriovOperatorConfig"))
+			config.SetName(consts.DefaultConfigName)
+			config.SetNamespace(testNamespace)
+			config.Object["spec"] = map[string]interface{}{
+				"enableInjector":        false,
+				"enableOperatorWebhook": false,
+				"logLevel":              0,
+				"disableDrain":          false,
+			}
+
+			Eventually(func() error {
+				return k8sClient.Create(context.Background(), config)
+			}).Should(Succeed())
+
+			By("Wait for the operator to reconcile the object")
+			Eventually(func(g Gomega) {
+				err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: consts.DefaultConfigName}, config)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(config.GetFinalizers()).To(ContainElement(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME))
+			}, util.APITimeout, util.RetryInterval).Should(Succeed())
+
+			By("Verify default values have not been omitted")
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(sriovnetworkv1.GroupVersion.WithKind("SriovOperatorConfig"))
+			err = k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: consts.DefaultConfigName}, obj)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(obj.Object["spec"]).To(HaveKeyWithValue("enableInjector", false))
+			Expect(obj.Object["spec"]).To(HaveKeyWithValue("enableOperatorWebhook", false))
+			Expect(obj.Object["spec"]).To(HaveKeyWithValue("logLevel", int64(0)))
+			Expect(obj.Object["spec"]).To(HaveKeyWithValue("disableDrain", false))
+		})
+
 		It("should be able to update the node selector of sriov-network-config-daemon", func() {
 			By("specify the configDaemonNodeSelector")
-			config := &sriovnetworkv1.SriovOperatorConfig{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: "default"}, config)).NotTo(HaveOccurred())
-
-			config.Spec.ConfigDaemonNodeSelector = map[string]string{"node-role.kubernetes.io/worker": ""}
-			err := k8sClient.Update(ctx, config)
-			Expect(err).NotTo(HaveOccurred())
+			nodeSelector := map[string]string{"node-role.kubernetes.io/worker": ""}
+			restore := updateConfigDaemonNodeSelector(nodeSelector)
+			DeferCleanup(restore)
 
 			daemonSet := &appsv1.DaemonSet{}
 			Eventually(func() map[string]string {
-				// By("wait for DaemonSet NodeSelector")
 				err := k8sClient.Get(ctx, types.NamespacedName{Name: "sriov-network-config-daemon", Namespace: testNamespace}, daemonSet)
 				if err != nil {
 					return nil
 				}
 				return daemonSet.Spec.Template.Spec.NodeSelector
-			}, util.APITimeout, util.RetryInterval).Should(Equal(config.Spec.ConfigDaemonNodeSelector))
+			}, util.APITimeout, util.RetryInterval).Should(Equal(nodeSelector))
+		})
+
+		It("should be able to update the node selector of sriov-network-device-plugin", func() {
+			By("specify the configDaemonNodeSelector")
+			daemonSet := &appsv1.DaemonSet{}
+			Eventually(func(g Gomega) {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "sriov-device-plugin", Namespace: testNamespace}, daemonSet)
+				g.Expect(err).ToNot(HaveOccurred())
+				_, exist := daemonSet.Spec.Template.Spec.NodeSelector["node-role.kubernetes.io/worker"]
+				g.Expect(exist).To(BeFalse())
+				_, exist = daemonSet.Spec.Template.Spec.NodeSelector[consts.SriovDevicePluginLabel]
+				g.Expect(exist).To(BeTrue())
+			}, util.APITimeout, util.RetryInterval).Should(Succeed())
+
+			nodeSelector := map[string]string{"node-role.kubernetes.io/worker": ""}
+			restore := updateConfigDaemonNodeSelector(nodeSelector)
+			DeferCleanup(restore)
+
+			Eventually(func(g Gomega) {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "sriov-device-plugin", Namespace: testNamespace}, daemonSet)
+				g.Expect(err).ToNot(HaveOccurred())
+				_, exist := daemonSet.Spec.Template.Spec.NodeSelector["node-role.kubernetes.io/worker"]
+				g.Expect(exist).To(BeTrue())
+				_, exist = daemonSet.Spec.Template.Spec.NodeSelector[consts.SriovDevicePluginLabel]
+				g.Expect(exist).To(BeTrue())
+			}, util.APITimeout, util.RetryInterval).Should(Succeed())
 		})
 
 		It("should be able to do multiple updates to the node selector of sriov-network-config-daemon", func() {
 			By("changing the configDaemonNodeSelector")
-			config := &sriovnetworkv1.SriovOperatorConfig{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: "default"}, config)).NotTo(HaveOccurred())
-			config.Spec.ConfigDaemonNodeSelector = map[string]string{"labelA": "", "labelB": "", "labelC": ""}
-			err := k8sClient.Update(ctx, config)
-			Expect(err).NotTo(HaveOccurred())
-			config.Spec.ConfigDaemonNodeSelector = map[string]string{"labelA": "", "labelB": ""}
-			err = k8sClient.Update(ctx, config)
-			Expect(err).NotTo(HaveOccurred())
+			firstNodeSelector := map[string]string{"labelA": "", "labelB": "", "labelC": ""}
+			restore := updateConfigDaemonNodeSelector(firstNodeSelector)
+			DeferCleanup(restore)
+
+			secondNodeSelector := map[string]string{"labelA": "", "labelB": ""}
+			updateConfigDaemonNodeSelector(secondNodeSelector)
 
 			daemonSet := &appsv1.DaemonSet{}
 			Eventually(func() map[string]string {
@@ -259,7 +414,7 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 					return nil
 				}
 				return daemonSet.Spec.Template.Spec.NodeSelector
-			}, util.APITimeout, util.RetryInterval).Should(Equal(config.Spec.ConfigDaemonNodeSelector))
+			}, util.APITimeout, util.RetryInterval).Should(Equal(secondNodeSelector))
 		})
 
 		It("should not render disable-plugins cmdline flag of sriov-network-config-daemon if disablePlugin not provided in spec", func() {
@@ -293,7 +448,22 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 				return strings.Join(daemonSet.Spec.Template.Spec.Containers[0].Args, " ")
 			}, util.APITimeout*10, util.RetryInterval).Should(ContainSubstring("disable-plugins=mellanox"))
 		})
+		It("should render configDaemonEnvVars in sriov-network-config-daemon if provided in spec", func() {
+			config := &sriovnetworkv1.SriovOperatorConfig{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: "default"}, config)).NotTo(HaveOccurred())
 
+			config.Spec.ConfigDaemonEnvVars = map[string]string{"TEST_ENV_VAR": "test_value"}
+			err := k8sClient.Update(ctx, config)
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func(g Gomega) {
+				daemonSet := &appsv1.DaemonSet{}
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "sriov-network-config-daemon", Namespace: testNamespace}, daemonSet)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(daemonSet.Spec.Template.Spec.Containers[0].Env).To(ContainElement(
+					corev1.EnvVar{Name: "TEST_ENV_VAR", Value: "test_value"}))
+			}, util.APITimeout*10, util.RetryInterval).Should(Succeed())
+		})
 		It("should render the resourceInjectorMatchCondition in the mutation if feature flag is enabled and block only pods with the networks annotation", func() {
 			By("set the feature flag")
 			config := &sriovnetworkv1.SriovOperatorConfig{}
@@ -333,41 +503,81 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
-		It("should deploy the metrics-exporter when the feature gate is enabled", func() {
-			config := &sriovnetworkv1.SriovOperatorConfig{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: "default"}, config)).NotTo(HaveOccurred())
-
-			daemonSet := &appsv1.DaemonSet{}
-			err := k8sClient.Get(ctx, types.NamespacedName{Name: "sriov-metrics-exporter", Namespace: testNamespace}, daemonSet)
-			Expect(err).To(HaveOccurred())
-			Expect(errors.IsNotFound(err)).To(BeTrue())
-
-			By("Turn `metricsExporter` feature gate on")
-			config.Spec.FeatureGates = map[string]bool{constants.MetricsExporterFeatureGate: true}
-			err = k8sClient.Update(ctx, config)
-			Expect(err).NotTo(HaveOccurred())
-
-			DeferCleanup(func() {
-				config.Spec.FeatureGates = map[string]bool{}
-				err = k8sClient.Update(ctx, config)
-				Expect(err).NotTo(HaveOccurred())
+		Context("metricsExporter feature gate", func() {
+			When("is disabled", func() {
+				It("should not deploy the daemonset", func() {
+					daemonSet := &appsv1.DaemonSet{}
+					err := k8sClient.Get(ctx, types.NamespacedName{Name: "sriov-metrics-exporter", Namespace: testNamespace}, daemonSet)
+					Expect(err).To(HaveOccurred())
+					Expect(errors.IsNotFound(err)).To(BeTrue())
+				})
 			})
 
-			err = util.WaitForNamespacedObject(&appsv1.DaemonSet{}, k8sClient, testNamespace, "sriov-network-metrics-exporter", util.RetryInterval, util.APITimeout)
-			Expect(err).NotTo(HaveOccurred())
+			When("is enabled", func() {
+				BeforeEach(func() {
+					config := &sriovnetworkv1.SriovOperatorConfig{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: "default"}, config)).NotTo(HaveOccurred())
 
-			err = util.WaitForNamespacedObject(&corev1.Service{}, k8sClient, testNamespace, "sriov-network-metrics-exporter-service", util.RetryInterval, util.APITimeout)
-			Expect(err).ToNot(HaveOccurred())
+					By("Turn `metricsExporter` feature gate on")
+					config.Spec.FeatureGates = map[string]bool{consts.MetricsExporterFeatureGate: true}
+					err := k8sClient.Update(ctx, config)
+					Expect(err).NotTo(HaveOccurred())
+				})
 
-			By("Turn `metricsExporter` feature gate off")
-			config.Spec.FeatureGates = map[string]bool{}
-			err = k8sClient.Update(ctx, config)
+				It("should deploy the sriov-network-metrics-exporter DaemonSet", func() {
+					err := util.WaitForNamespacedObject(&appsv1.DaemonSet{}, k8sClient, testNamespace, "sriov-network-metrics-exporter", util.RetryInterval, util.APITimeout)
+					Expect(err).NotTo(HaveOccurred())
 
-			err = util.WaitForNamespacedObjectDeleted(&appsv1.DaemonSet{}, k8sClient, testNamespace, "sriov-network-metrics-exporter", util.RetryInterval, util.APITimeout)
-			Expect(err).NotTo(HaveOccurred())
+					err = util.WaitForNamespacedObject(&corev1.Service{}, k8sClient, testNamespace, "sriov-network-metrics-exporter-service", util.RetryInterval, util.APITimeout)
+					Expect(err).ToNot(HaveOccurred())
+				})
 
-			err = util.WaitForNamespacedObjectDeleted(&corev1.Service{}, k8sClient, testNamespace, "sriov-network-metrics-exporter-service", util.RetryInterval, util.APITimeout)
-			Expect(err).ToNot(HaveOccurred())
+				It("should deploy the sriov-network-metrics-exporter using the Spec.ConfigDaemonNodeSelector field", func() {
+					nodeSelector := map[string]string{
+						"node-role.kubernetes.io/worker": "",
+						"bool-key":                       "true",
+					}
+
+					restore := updateConfigDaemonNodeSelector(nodeSelector)
+					DeferCleanup(restore)
+
+					Eventually(func(g Gomega) {
+						metricsDaemonset := appsv1.DaemonSet{}
+						err := util.WaitForNamespacedObject(&metricsDaemonset, k8sClient, testNamespace, "sriov-network-metrics-exporter", util.RetryInterval, util.APITimeout)
+						g.Expect(err).NotTo(HaveOccurred())
+						g.Expect(metricsDaemonset.Spec.Template.Spec.NodeSelector).To(Equal(nodeSelector))
+					}, time.Minute, time.Second).Should(Succeed())
+				})
+
+				It("should deploy extra configuration when the Prometheus operator is installed", func() {
+					DeferCleanup(os.Setenv, "METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED", os.Getenv("METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED"))
+					os.Setenv("METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED", "true")
+					DeferCleanup(os.Setenv, "METRICS_EXPORTER_PROMETHEUS_DEPLOY_RULES", os.Getenv("METRICS_EXPORTER_PROMETHEUS_DEPLOY_RULES"))
+					os.Setenv("METRICS_EXPORTER_PROMETHEUS_DEPLOY_RULES", "true")
+
+					err := util.WaitForNamespacedObject(&rbacv1.Role{}, k8sClient, testNamespace, "prometheus-k8s", util.RetryInterval, util.APITimeout)
+					Expect(err).ToNot(HaveOccurred())
+
+					err = util.WaitForNamespacedObject(&rbacv1.RoleBinding{}, k8sClient, testNamespace, "prometheus-k8s", util.RetryInterval, util.APITimeout)
+					Expect(err).ToNot(HaveOccurred())
+
+					assertResourceExists(
+						schema.GroupVersionKind{
+							Group:   "monitoring.coreos.com",
+							Kind:    "ServiceMonitor",
+							Version: "v1",
+						},
+						client.ObjectKey{Namespace: testNamespace, Name: "sriov-network-metrics-exporter"})
+
+					assertResourceExists(
+						schema.GroupVersionKind{
+							Group:   "monitoring.coreos.com",
+							Kind:    "PrometheusRule",
+							Version: "v1",
+						},
+						client.ObjectKey{Namespace: testNamespace, Name: "sriov-vf-rules"})
+				})
+			})
 		})
 
 		// This test verifies that the CABundle field in the webhook configuration  added by third party components is not
@@ -406,7 +616,7 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 			// echo "ca-bundle-2" | base64 -w 0
 			os.Setenv("ADMISSION_CONTROLLERS_CERTIFICATES_INJECTOR_CA_CRT", "Y2EtYnVuZGxlLTIK")
 
-			DeferCleanup(func(old string) { vars.ClusterType = old }, vars.ClusterType)
+			DeferCleanup(func(old consts.ClusterType) { vars.ClusterType = old }, vars.ClusterType)
 			vars.ClusterType = consts.ClusterTypeKubernetes
 
 			err := util.TriggerSriovOperatorConfigReconcile(k8sClient, testNamespace)
@@ -429,51 +639,56 @@ var _ = Describe("SriovOperatorConfig controller", Ordered, func() {
 				g.Expect(injectorCfg.Webhooks[0].ClientConfig.CABundle).To(Equal([]byte("ca-bundle-2\n")))
 			}, "1s").Should(Succeed())
 		})
-		It("should reconcile to a converging state when multiple node policies are set", func() {
-			By("Creating a consistent number of node policies")
-			for i := 0; i < 30; i++ {
-				p := &sriovnetworkv1.SriovNetworkNodePolicy{
-					ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: fmt.Sprintf("p%d", i)},
-					Spec: sriovnetworkv1.SriovNetworkNodePolicySpec{
-						Priority:     99,
-						NodeSelector: map[string]string{"foo": fmt.Sprintf("v%d", i)},
-					},
-				}
-				err := k8sClient.Create(context.Background(), p)
-				Expect(err).NotTo(HaveOccurred())
-			}
-
-			By("Triggering a the reconcile loop")
-			config := &sriovnetworkv1.SriovOperatorConfig{}
-			err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "default", Namespace: testNamespace}, config)
-			Expect(err).NotTo(HaveOccurred())
-			if config.ObjectMeta.Labels == nil {
-				config.ObjectMeta.Labels = make(map[string]string)
-			}
-			config.ObjectMeta.Labels["trigger-test"] = "test-reconcile-daemonset"
-			err = k8sClient.Update(context.Background(), config)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Wait until device-plugin Daemonset's affinity has been calculated")
-			var expectedAffinity *corev1.Affinity
-
-			Eventually(func(g Gomega) {
-				daemonSet := &appsv1.DaemonSet{}
-				err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "sriov-device-plugin", Namespace: testNamespace}, daemonSet)
-				g.Expect(err).NotTo(HaveOccurred())
-				// Wait until the last policy (with NodeSelector foo=v29) has been considered at least one time
-				g.Expect(daemonSet.Spec.Template.Spec.Affinity.String()).To(ContainSubstring("v29"))
-				expectedAffinity = daemonSet.Spec.Template.Spec.Affinity
-			}, "3s", "1s").Should(Succeed())
-
-			By("Verify device-plugin Daemonset's affinity doesn't change over time")
-			Consistently(func(g Gomega) {
-				daemonSet := &appsv1.DaemonSet{}
-				err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "sriov-device-plugin", Namespace: testNamespace}, daemonSet)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(daemonSet.Spec.Template.Spec.Affinity).
-					To(Equal(expectedAffinity))
-			}, "3s", "1s").Should(Succeed())
-		})
 	})
 })
+
+func makeDefaultSriovOpConfig() *sriovnetworkv1.SriovOperatorConfig {
+	config := &sriovnetworkv1.SriovOperatorConfig{}
+	config.SetNamespace(testNamespace)
+	config.SetName(consts.DefaultConfigName)
+	config.Spec = sriovnetworkv1.SriovOperatorConfigSpec{
+		EnableInjector:           true,
+		EnableOperatorWebhook:    true,
+		ConfigDaemonNodeSelector: map[string]string{},
+		LogLevel:                 2,
+	}
+	return config
+}
+
+func assertResourceExists(gvk schema.GroupVersionKind, key client.ObjectKey) {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvk)
+	err := k8sClient.Get(context.Background(), key, u)
+	Expect(err).NotTo(HaveOccurred())
+}
+
+func assertResourceDoesNotExist(gvk schema.GroupVersionKind, key client.ObjectKey) {
+	Eventually(func(g Gomega) {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(gvk)
+		err := k8sClient.Get(context.Background(), key, u)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(errors.IsNotFound(err)).To(BeTrue())
+	}).
+		WithOffset(1).
+		WithPolling(100*time.Millisecond).
+		WithTimeout(2*time.Second).
+		Should(Succeed(), "Resource type[%s] name[%s] still present in the cluster", gvk.String(), key.String())
+}
+
+func updateConfigDaemonNodeSelector(newValue map[string]string) func() {
+	config := &sriovnetworkv1.SriovOperatorConfig{}
+	err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: "default"}, config)
+	Expect(err).NotTo(HaveOccurred())
+
+	previousValue := config.Spec.ConfigDaemonNodeSelector
+	ret := func() {
+		updateConfigDaemonNodeSelector(previousValue)
+	}
+
+	config.Spec.ConfigDaemonNodeSelector = newValue
+	err = k8sClient.Update(context.Background(), config)
+	Expect(err).NotTo(HaveOccurred())
+
+	return ret
+}

@@ -13,6 +13,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
@@ -62,8 +63,8 @@ func validateSriovOperatorConfigDisableDrain(cr *sriovnetworkv1.SriovOperatorCon
 	if !cr.Spec.DisableDrain {
 		return nil
 	}
-
-	previousConfig, err := snclient.SriovnetworkV1().SriovOperatorConfigs(cr.Namespace).Get(context.Background(), cr.Name, metav1.GetOptions{})
+	previousConfig := &sriovnetworkv1.SriovOperatorConfig{}
+	err := client.Get(context.Background(), runtimeclient.ObjectKey{Name: cr.Name, Namespace: namespace}, previousConfig)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
@@ -77,7 +78,8 @@ func validateSriovOperatorConfigDisableDrain(cr *sriovnetworkv1.SriovOperatorCon
 	}
 
 	// DisableDrain has been changed `false -> true`, check if any node is updating
-	nodeStates, err := snclient.SriovnetworkV1().SriovNetworkNodeStates(namespace).List(context.Background(), metav1.ListOptions{})
+	nodeStates := &sriovnetworkv1.SriovNetworkNodeStateList{}
+	err = client.List(context.Background(), nodeStates, &runtimeclient.ListOptions{Namespace: namespace})
 	if err != nil {
 		return fmt.Errorf("can't validate SriovOperatorConfig[%s] DisableDrain transition to true: %q", cr.Name, err)
 	}
@@ -95,10 +97,6 @@ func validateSriovOperatorConfigDisableDrain(cr *sriovnetworkv1.SriovOperatorCon
 func validateSriovNetworkPoolConfig(cr *sriovnetworkv1.SriovNetworkPoolConfig, operation v1.Operation) (bool, []string, error) {
 	log.Log.V(2).Info("validateSriovNetworkPoolConfig", "object", cr)
 	var warnings []string
-
-	if cr.GetName() == consts.DefaultConfigName && operation == v1.Delete {
-		return false, warnings, fmt.Errorf("default SriovOperatorConfig shouldn't be deleted")
-	}
 
 	if (cr.Spec.MaxUnavailable != nil || cr.Spec.NodeSelector != nil) && cr.Spec.OvsHardwareOffloadConfig.Name != "" {
 		return false, warnings, fmt.Errorf("SriovOperatorConfig can't have both parallel configuration and OvsHardwareOffloadConfig")
@@ -213,6 +211,12 @@ func staticValidateSriovNetworkNodePolicy(cr *sriovnetworkv1.SriovNetworkNodePol
 	if cr.Spec.DeviceType == consts.DeviceTypeVfioPci && cr.Spec.IsRdma {
 		return false, fmt.Errorf("'deviceType: vfio-pci' conflicts with 'isRdma: true'; Set 'deviceType' to (string)'netdevice' Or Set 'isRdma' to (bool)'false'")
 	}
+
+	// switchdev mode can be used only with ethernet links
+	if cr.Spec.LinkType != "" && !strings.EqualFold(cr.Spec.LinkType, consts.LinkTypeETH) && cr.Spec.EswitchMode == sriovnetworkv1.ESwithModeSwitchDev {
+		return false, fmt.Errorf("'eSwitchMode: switchdev' can be used only with ethernet links")
+	}
+
 	// vdpa: deviceType must be set to 'netdevice'
 	if cr.Spec.DeviceType != consts.DeviceTypeNetDevice && (cr.Spec.VdpaType == consts.VdpaTypeVirtio || cr.Spec.VdpaType == consts.VdpaTypeVhost) {
 		return false, fmt.Errorf("'deviceType: %s' conflicts with '%s'; Set 'deviceType' to (string)'netdevice' Or Remove 'vdpaType'", cr.Spec.DeviceType, cr.Spec.VdpaType)
@@ -220,6 +224,14 @@ func staticValidateSriovNetworkNodePolicy(cr *sriovnetworkv1.SriovNetworkNodePol
 	// vdpa: device must be configured in switchdev mode
 	if (cr.Spec.VdpaType == consts.VdpaTypeVirtio || cr.Spec.VdpaType == consts.VdpaTypeVhost) && cr.Spec.EswitchMode != sriovnetworkv1.ESwithModeSwitchDev {
 		return false, fmt.Errorf("vdpa requires the device to be configured in switchdev mode")
+	}
+	// software bridge management: device must be configured in switchdev mode
+	if !cr.Spec.Bridge.IsEmpty() && cr.Spec.EswitchMode != sriovnetworkv1.ESwithModeSwitchDev {
+		return false, fmt.Errorf("software bridge management requires the device to be configured in switchdev mode")
+	}
+	// software bridge management: device can't be externally managed
+	if !cr.Spec.Bridge.IsEmpty() && cr.Spec.ExternallyManaged {
+		return false, fmt.Errorf("software bridge management can't be used when the device externally managed")
 	}
 	return true, nil
 }
@@ -235,11 +247,13 @@ func dynamicValidateSriovNetworkNodePolicy(cr *sriovnetworkv1.SriovNetworkNodePo
 	if err != nil {
 		return false, err
 	}
-	nsList, err := snclient.SriovnetworkV1().SriovNetworkNodeStates(namespace).List(context.Background(), metav1.ListOptions{})
+	nsList := &sriovnetworkv1.SriovNetworkNodeStateList{}
+	err = client.List(context.Background(), nsList, &runtimeclient.ListOptions{Namespace: namespace})
 	if err != nil {
 		return false, err
 	}
-	npList, err := snclient.SriovnetworkV1().SriovNetworkNodePolicies(namespace).List(context.Background(), metav1.ListOptions{})
+	npList := &sriovnetworkv1.SriovNetworkNodePolicyList{}
+	err = client.List(context.Background(), npList, &runtimeclient.ListOptions{Namespace: namespace})
 	if err != nil {
 		return false, err
 	}
@@ -323,7 +337,7 @@ func validatePolicyForNodeState(policy *sriovnetworkv1.SriovNetworkNodePolicy, s
 					return nil, fmt.Errorf("MTU(%d) in CR %s is higher than the MTU for the PF externally value(%d)", policy.Spec.Mtu, policy.GetName(), iface.Mtu)
 				}
 
-				if policy.Spec.LinkType != "" && strings.ToLower(policy.Spec.LinkType) != strings.ToLower(iface.LinkType) {
+				if policy.Spec.LinkType != "" && !strings.EqualFold(policy.Spec.LinkType, iface.LinkType) {
 					return nil, fmt.Errorf("LinkType(%s) in CR %s is not equal to the LinkType for the PF externally value(%s)", policy.Spec.LinkType, policy.GetName(), iface.LinkType)
 				}
 			}

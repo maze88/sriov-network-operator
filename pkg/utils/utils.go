@@ -3,12 +3,13 @@ package utils
 import (
 	"bytes"
 	"fmt"
-	"math/rand"
-	"net"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -16,10 +17,15 @@ import (
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
 )
 
+const (
+	httpRequestTimeout = 5 * time.Second
+)
+
 //go:generate ../../bin/mockgen -destination mock/mock_utils.go -source utils.go
 type CmdInterface interface {
 	Chroot(string) (func() error, error)
 	RunCommand(string, ...string) (string, string, error)
+	HTTPGetFetchData(string) (string, error)
 }
 
 type utilsHelper struct {
@@ -29,6 +35,7 @@ func New() CmdInterface {
 	return &utilsHelper{}
 }
 
+// Chroot run a chroot command on a specific path
 func (u *utilsHelper) Chroot(path string) (func() error, error) {
 	root, err := os.Open("/")
 	if err != nil {
@@ -51,6 +58,36 @@ func (u *utilsHelper) Chroot(path string) (func() error, error) {
 	}, nil
 }
 
+func (u *utilsHelper) HTTPGetFetchData(url string) (string, error) {
+	// Initialize an HTTP client with a specific timeout.
+	client := http.Client{
+		Timeout: httpRequestTimeout,
+	}
+
+	// Perform the GET request.
+	resp, err := client.Get(url)
+	if err != nil {
+		// This error typically indicates a network issue or that the server is unreachable.
+		return "", fmt.Errorf("HTTP GET request to %s failed: %w", url, err)
+	}
+	// Ensure the response body is closed after the function returns.
+	defer resp.Body.Close()
+
+	// Check if the HTTP status code is OK (200).
+	if resp.StatusCode != http.StatusOK {
+		// Attempt to read the body for more detailed error information if available.
+		errorBodyBytes, _ := io.ReadAll(resp.Body) // ReadAll might return its own error, but we prioritize the status code error.
+		return "", fmt.Errorf("request to %s returned status %s: %s", url, resp.Status, string(errorBodyBytes))
+	}
+
+	// Read the entire response body.
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body from %s: %w", url, err)
+	}
+	return string(bodyBytes), nil
+}
+
 // RunCommand runs a command
 func (u *utilsHelper) RunCommand(command string, args ...string) (string, string, error) {
 	log.Log.Info("RunCommand()", "command", command, "args", args)
@@ -63,19 +100,6 @@ func (u *utilsHelper) RunCommand(command string, args ...string) (string, string
 	err := cmd.Run()
 	log.Log.V(2).Info("RunCommand()", "output", stdout.String(), "error", err)
 	return stdout.String(), stderr.String(), err
-}
-
-func GenerateRandomGUID() net.HardwareAddr {
-	guid := make(net.HardwareAddr, 8)
-
-	// First field is 0x01 - xfe to avoid all zero and all F invalid guids
-	guid[0] = byte(1 + rand.Intn(0xfe))
-
-	for i := 1; i < len(guid); i++ {
-		guid[i] = byte(rand.Intn(0x100))
-	}
-
-	return guid
 }
 
 func IsCommandNotFound(err error) bool {

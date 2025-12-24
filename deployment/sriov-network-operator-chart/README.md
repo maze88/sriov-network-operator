@@ -41,7 +41,7 @@ For additional information and methods for installing Helm, refer to the officia
 #### Deploy from OCI repo
 
 ```
-$ helm install -n sriov-network-operator --create-namespace --version 1.3.0 --set sriovOperatorConfig.deploy=true sriov-network-operator oci://ghcr.io/k8snetworkplumbingwg/sriov-network-operator-chart
+$ helm install -n sriov-network-operator --create-namespace --version 1.5.0 --set sriovOperatorConfig.deploy=true sriov-network-operator oci://ghcr.io/k8snetworkplumbingwg/sriov-network-operator-chart
 ```
 
 #### Deploy from project sources
@@ -77,7 +77,8 @@ We have introduced the following Chart parameters.
 | Name | Type | Default | description |
 | ---- | ---- | ------- | ----------- |
 | `operator.tolerations` | list | `[{"key":"node-role.kubernetes.io/master","operator":"Exists","effect":"NoSchedule"},{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]` | Operator's tolerations |
-| `operator.nodeSelector` | object | {} | Operator's node selector |
+| `operator.nodeSelector` | object | `{}` | Operator's node selector |
+| `operator.extraEnv` | map[string]string | `{}` | Custom extra environment variables for the operator container |
 | `operator.affinity` | object | `{"nodeAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":1,"preference":{"matchExpressions":[{"key":"node-role.kubernetes.io/master","operator":"In","values":[""]}]}},{"weight":1,"preference":{"matchExpressions":[{"key":"node-role.kubernetes.io/control-plane","operator":"In","values":[""]}]}}]}}` | Operator's afffinity configuration |
 | `operator.nameOverride` | string | `` | Operator's resource name override |
 | `operator.fullnameOverride` | string | `` | Operator's resource full name override |
@@ -86,6 +87,10 @@ We have introduced the following Chart parameters.
 | `operator.clustertype` | string | `kubernetes` | Cluster environment type |
 | `operator.metricsExporter.port` | string | `9110` | Port where the Network Metrics Exporter listen |
 | `operator.metricsExporter.certificates.secretName` | string | `metrics-exporter-cert` | Secret name to serve metrics via TLS. The secret must have the same fields as `operator.admissionControllers.certificates.secretNames` |
+| `operator.metricsExporter.prometheusOperator.enabled` | bool | false | Wheter the operator shoud configure Prometheus resources or not (e.g. `ServiceMonitors`). |
+| `operator.metricsExporter.prometheusOperator.serviceAccount` | string | `prometheus-k8s` | The service account used by the Prometheus Operator. This is used to give Prometheus the permission to list resource in the SR-IOV operator namespace |
+| `operator.metricsExporter.prometheusOperator.namespace` | string | `monitoring` | The namespace where the Prometheus Operator is installed. Setting this variable makes the operator deploy `monitoring.coreos.com` resources. |
+| `operator.metricsExporter.prometheusOperator.deployRules` | bool | false | Whether the operator should deploy `PrometheusRules` to scrape namespace version of metrics. |
 
 #### Admission Controllers parameters
 
@@ -125,10 +130,18 @@ This section contains general parameters that apply to both the operator and dae
 | Name | Type | Default | description |
 | ---- | ---- | ------- | ----------- |
 | `sriovOperatorConfig.deploy` | bool | `false` | deploy SriovOperatorConfig custom resource |
-| `sriovOperatorConfig.configDaemonNodeSelector` | map[string]string | `{}` | node slectors for sriov-network-config-daemon |
+| `sriovOperatorConfig.configDaemonNodeSelector` | map[string]string | `{}` | node selectors for sriov-network-config-daemon |
 | `sriovOperatorConfig.logLevel` | int | `2` | log level for both operator and sriov-network-config-daemon |
 | `sriovOperatorConfig.disableDrain` | bool | `false` | disable node draining when configuring SR-IOV, set to true in case of a single node cluster or any other justifiable reason |
 | `sriovOperatorConfig.configurationMode` | string | `daemon` | sriov-network-config-daemon configuration mode. either `daemon` or `systemd` |
+| `sriovOperatorConfig.disablePlugins` | list | `[]` | list of sriov-network-config-daemon plugins to disable (e.g., `["mellanox"]`) |
+| `sriovOperatorConfig.featureGates` | map[string]bool | `{}` | feature gates to enable/disable |
+| `sriovOperatorConfig.configDaemonEnvVars` | map[string]string | `{}` | custom environment variables for sriov-network-config-daemon |
+
+**Note** 
+
+When `sriovOperatorConfig.configurationMode` is configured as `systemd`, configurations files and `systemd` service files are created on the node.
+Upon chart deletion, those files are not cleaned up. For cases where this is not acceptable, users should rather configured the `daemon` mode.
 
 ### Images parameters
 
@@ -139,6 +152,7 @@ This section contains general parameters that apply to both the operator and dae
 | `images.sriovCni` | SR-IOV CNI image |
 | `images.ibSriovCni` | InfiniBand SR-IOV CNI image |
 | `images.ovsCni` | OVS CNI image |
+| `images.rdmaCni` | RDMA CNI image              |
 | `images.sriovDevicePlugin` | SR-IOV device plugin image |
 | `images.resourcesInjector` | Resources Injector image |
 | `images.webhook` | Operator Webhook image |

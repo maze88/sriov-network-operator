@@ -27,7 +27,7 @@ spec:
       hostNetwork: true
       nodeSelector:
         {{- range $key, $value := .NodeSelectorField }}
-          {{ $key }}: {{ $value }}
+          {{ $key }}: "{{ $value }}"
         {{- end }}
       tolerations:
       - operator: Exists
@@ -56,6 +56,7 @@ spec:
               fieldPath: spec.nodeName
         securityContext:
           privileged: true
+          readOnlyRootFilesystem: true
         resources:
           requests:
             cpu: 10m

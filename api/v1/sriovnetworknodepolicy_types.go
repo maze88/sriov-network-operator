@@ -76,7 +76,10 @@ type SriovNetworkNicSelector struct {
 	RootDevices []string `json:"rootDevices,omitempty"`
 	// Name of SR-IoV PF.
 	PfNames []string `json:"pfNames,omitempty"`
-	// Infrastructure Networking selection filter. Allowed value "openstack/NetworkID:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+	// Infrastructure Networking selection filter.
+	// Allowed values:
+	// - "openstack/NetworkID:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+	// - "aws/NetworkID:xxxxxxxx"
 	NetFilter string `json:"netFilter,omitempty"`
 }
 
@@ -107,6 +110,9 @@ type OVSBridgeConfig struct {
 	ExternalIDs map[string]string `json:"externalIDs,omitempty"`
 	// additional options to inject to other_config field in the bridge table in OVSDB
 	OtherConfig map[string]string `json:"otherConfig,omitempty"`
+	// configure fail_mode field in the Bridge table in OVSDB (optional). 'secure' or 'standalone'.
+	// +kubebuilder:validation:Enum=secure;standalone
+	FailMode string `json:"failMode,omitempty"`
 }
 
 // OVSUplinkConfig contains PF interface configuration for the bridge
@@ -125,6 +131,8 @@ type OVSInterfaceConfig struct {
 	ExternalIDs map[string]string `json:"externalIDs,omitempty"`
 	// other_config field in the Interface table in OVSDB
 	OtherConfig map[string]string `json:"otherConfig,omitempty"`
+	// mtu_request field in the Interface table in OVSDB
+	MTURequest *int `json:"mtuRequest,omitempty"`
 }
 
 // SriovNetworkNodePolicyStatus defines the observed state of SriovNetworkNodePolicy

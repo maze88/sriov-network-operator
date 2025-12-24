@@ -7,25 +7,33 @@ spec:
   selector:
     matchLabels:
       name: sriov-network-operator
-  updateStrategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 33%
+  strategy:
+    type: Recreate
   template:
     metadata:
       labels:
         name: sriov-network-operator
+      annotations:
+        openshift.io/required-scc: restricted-v2
     spec:
       affinity:
         nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: node-role.kubernetes.io/master
-                operator: Exists
-            - matchExpressions:
-                - key: node-role.kubernetes.io/control-plane
-                  operator: Exists
+          # In the context of Hypershift, the SR-IOV network
+          # Operator is deployed on Nodepools which are labeled
+          # as workers. So we relax the node affinity to prefer
+          # masters/control-plane when possible otherwise we
+          # schedule where it's possible.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 1
+              preference:
+                matchExpressions:
+                  - key: "node-role.kubernetes.io/master"
+                    operator: Exists
+            - weight: 1
+              preference:
+                matchExpressions:
+                  - key: "node-role.kubernetes.io/control-plane"
+                    operator: Exists
       tolerations:
       - effect: NoSchedule
         key: node-role.kubernetes.io/master
@@ -41,8 +49,9 @@ spec:
           image: $SRIOV_NETWORK_OPERATOR_IMAGE
           command:
           - sriov-network-operator
-          args:
-          - --leader-elect=$OPERATOR_LEADER_ELECTION_ENABLE
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
           resources:
             requests:
               cpu: 100m
@@ -58,6 +67,8 @@ spec:
               value: $SRIOV_INFINIBAND_CNI_IMAGE
             - name: OVS_CNI_IMAGE
               value: $OVS_CNI_IMAGE
+            - name: RDMA_CNI_IMAGE
+              value: $RDMA_CNI_IMAGE
             - name: SRIOV_DEVICE_PLUGIN_IMAGE
               value: $SRIOV_DEVICE_PLUGIN_IMAGE
             - name: NETWORK_RESOURCES_INJECTOR_IMAGE
@@ -72,6 +83,14 @@ spec:
               value: $METRICS_EXPORTER_IMAGE
             - name: METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE
               value: $METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE
+            - name: METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED
+              value: "$METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED"
+            - name: METRICS_EXPORTER_PROMETHEUS_DEPLOY_RULES
+              value: "$METRICS_EXPORTER_PROMETHEUS_DEPLOY_RULES"
+            - name: METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT
+              value: $METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT
+            - name: METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE
+              value: $METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE
             - name: RESOURCE_PREFIX
               value: $RESOURCE_PREFIX
             - name: DEV_MODE

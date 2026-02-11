@@ -25,12 +25,13 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	netattdefv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	openshiftconfigv1 "github.com/openshift/api/config/v1"
-	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
+	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/client-go/rest"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -48,11 +49,8 @@ import (
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/controllers"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/featuregate"
-	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/leaderelection"
-
-	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
 	snolog "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/log"
-	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/platforms"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/orchestrator"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/utils"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
 	//+kubebuilder:scaffold:imports
@@ -75,66 +73,40 @@ func init() {
 
 func main() {
 	var metricsAddr string
-	var enableLeaderElection bool
 	var probeAddr string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
+
 	snolog.BindFlags(flag.CommandLine)
 	flag.Parse()
 	snolog.InitLog()
 
 	restConfig := ctrl.GetConfigOrDie()
 
-	kubeClient, err := client.New(restConfig, client.Options{Scheme: scheme})
-	if err != nil {
-		setupLog.Error(err, "couldn't create client")
-		os.Exit(1)
-	}
-
 	if vars.ResourcePrefix == "" {
 		setupLog.Error(nil, "RESOURCE_PREFIX environment variable can't be empty")
 		os.Exit(1)
 	}
 
-	le := leaderelection.GetLeaderElectionConfig(kubeClient, enableLeaderElection)
-
-	leaderElectionMgr, err := ctrl.NewManager(restConfig, ctrl.Options{
-		Scheme:                        scheme,
-		HealthProbeBindAddress:        probeAddr,
-		Metrics:                       server.Options{BindAddress: "0"},
-		LeaderElection:                enableLeaderElection,
-		LeaseDuration:                 &le.LeaseDuration,
-		LeaderElectionReleaseOnCancel: true,
-		RenewDeadline:                 &le.RenewDeadline,
-		RetryPeriod:                   &le.RetryPeriod,
-		LeaderElectionID:              consts.LeaderElectionID,
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme:                 scheme,
+		HealthProbeBindAddress: probeAddr,
+		Metrics:                server.Options{BindAddress: metricsAddr},
+		WebhookServer:          webhook.NewServer(webhook.Options{Port: 9443}),
+		Cache:                  cache.Options{DefaultNamespaces: map[string]cache.Config{vars.Namespace: {}}},
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to start leader election manager")
+		setupLog.Error(err, "unable to create manager")
 		os.Exit(1)
 	}
 
-	if err := leaderElectionMgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
-	if err := leaderElectionMgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
-		os.Exit(1)
-	}
-
-	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
-		Scheme:        scheme,
-		Metrics:       server.Options{BindAddress: metricsAddr},
-		WebhookServer: webhook.NewServer(webhook.Options{Port: 9443}),
-		Cache:         cache.Options{DefaultNamespaces: map[string]cache.Config{vars.Namespace: {}}},
-	})
-	if err != nil {
-		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
@@ -166,7 +138,6 @@ func main() {
 	err = mgrGlobal.GetCache().IndexField(context.Background(), &sriovnetworkv1.OVSNetwork{}, "spec.networkNamespace", func(o client.Object) []string {
 		return []string{o.(*sriovnetworkv1.OVSNetwork).Spec.NetworkNamespace}
 	})
-
 	if err != nil {
 		setupLog.Error(err, "unable to create index field for cache")
 		os.Exit(1)
@@ -181,9 +152,9 @@ func main() {
 	vars.Config = restConfig
 	vars.Scheme = mgrGlobal.GetScheme()
 
-	platformsHelper, err := platforms.NewDefaultPlatformHelper()
+	orch, err := orchestrator.New(vars.ClusterType)
 	if err != nil {
-		setupLog.Error(err, "couldn't create openshift context")
+		setupLog.Error(err, "couldn't create orchestrator")
 		os.Exit(1)
 	}
 
@@ -219,69 +190,29 @@ func main() {
 		os.Exit(1)
 	}
 	if err = (&controllers.SriovOperatorConfigReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		PlatformHelper: platformsHelper,
-		FeatureGate:    featureGate,
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Orchestrator:      orch,
+		FeatureGate:       featureGate,
+		UncachedAPIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SriovOperatorConfig")
 		os.Exit(1)
 	}
 	if err = (&controllers.SriovNetworkPoolConfigReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		PlatformHelper: platformsHelper,
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		Orchestrator: orch,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SriovNetworkPoolConfig")
 		os.Exit(1)
 	}
 
-	// we need a client that doesn't use the local cache for the objects
-	drainKClient, err := client.New(restConfig, client.Options{
-		Scheme: scheme,
-		Cache: &client.CacheOptions{
-			DisableFor: []client.Object{
-				&sriovnetworkv1.SriovNetworkNodeState{},
-				&corev1.Node{},
-				&mcfgv1.MachineConfigPool{},
-			},
-		},
-	})
-	if err != nil {
-		setupLog.Error(err, "unable to create drain kubernetes client")
-		os.Exit(1)
-	}
-
-	drainController, err := controllers.NewDrainReconcileController(drainKClient,
-		mgr.GetScheme(),
-		mgr.GetEventRecorderFor("SR-IOV operator"),
-		platformsHelper)
-	if err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DrainReconcile")
-		os.Exit(1)
-	}
-
-	if err = drainController.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to setup controller with manager", "controller", "DrainReconcile")
+	if err := setupDrainController(mgr, restConfig, orch, mgr.GetScheme()); err != nil {
+		setupLog.Error(err, "unable to setup drain controller")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
-
-	leaderElectionErr := make(chan error)
-	leaderElectionContext, cancelLeaderElection := context.WithCancel(context.Background())
-	go func() {
-		setupLog.Info("starting leader election manager")
-		leaderElectionErr <- leaderElectionMgr.Start(leaderElectionContext)
-	}()
-
-	select {
-	case <-leaderElectionMgr.Elected():
-	case err := <-leaderElectionErr:
-		setupLog.Error(err, "Leader Election Manager error")
-		os.Exit(1)
-	}
-
-	setupLog.Info("acquired lease")
 
 	stopSignalCh := ctrl.SetupSignalHandler()
 
@@ -299,56 +230,88 @@ func main() {
 		namespacedManagerErr <- mgr.Start(namespacedManagerCtx)
 	}()
 
+	shutdownClient, err := client.New(restConfig, client.Options{
+		Scheme: vars.Scheme,
+		Cache: &client.CacheOptions{
+			DisableFor: []client.Object{
+				&sriovnetworkv1.SriovNetwork{},
+			},
+		},
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to create generic client for shutdown process")
+		os.Exit(1)
+	}
+
 	select {
 	// Wait for a stop signal
 	case <-stopSignalCh.Done():
 		setupLog.Info("Stop signal received")
-
 		globalManagerCancel()
 		namespacedManagerCancel()
 		<-globalManagerErr
 		<-namespacedManagerErr
-
-		utils.Shutdown()
-
-		cancelLeaderElection()
-		<-leaderElectionErr
-
-	case err := <-leaderElectionErr:
-		setupLog.Error(err, "Leader Election Manager error")
-		globalManagerCancel()
-		namespacedManagerCancel()
-		<-globalManagerErr
-		<-namespacedManagerErr
-
-		os.Exit(1)
+		utils.Shutdown(shutdownClient)
 
 	case err := <-globalManagerErr:
 		setupLog.Error(err, "Global Manager error")
-
 		namespacedManagerCancel()
 		<-namespacedManagerErr
-
-		utils.Shutdown()
-
-		cancelLeaderElection()
-		<-leaderElectionErr
+		utils.Shutdown(shutdownClient)
 
 		os.Exit(1)
 
 	case err := <-namespacedManagerErr:
 		setupLog.Error(err, "Namsepaced Manager error")
-
 		globalManagerCancel()
 		<-globalManagerErr
-
-		utils.Shutdown()
-
-		cancelLeaderElection()
-		<-leaderElectionErr
+		utils.Shutdown(shutdownClient)
 
 		os.Exit(1)
 	}
+}
+
+func setupDrainController(mgr ctrl.Manager, restConfig *rest.Config,
+	orch orchestrator.Interface, scheme *runtime.Scheme) error {
+	if vars.UseExternalDrainer {
+		// even though UseExternalDrainer is set, we are keeping internal drain controller for handling
+		// use-cases when there are existing nodes under drain_required state, which won't be handled
+		// externally, since UseExternalDrainer was set only after they were scheduled for draining.
+		setupLog.Info("'UseExternalDrainer' is set, draining will be done externally")
+	}
+
+	// we need a client that doesn't use the local cache for the objects
+	drainKClient, err := client.New(restConfig, client.Options{
+		Scheme: scheme,
+		Cache: &client.CacheOptions{
+			DisableFor: []client.Object{
+				&sriovnetworkv1.SriovNetworkNodeState{},
+				&corev1.Node{},
+				&mcfgv1.MachineConfigPool{},
+			},
+		},
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to create drain kubernetes client")
+		return err
+	}
+
+	drainController, err := controllers.NewDrainReconcileController(
+		drainKClient,
+		mgr.GetScheme(),
+		mgr.GetEventRecorderFor("SR-IOV operator"),
+		orch)
+	if err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "DrainReconcile")
+		return err
+	}
+
+	if err = drainController.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to setup controller with manager", "controller", "DrainReconcile")
+		return err
+	}
+
+	return nil
 }
 
 func initNicIDMap() error {

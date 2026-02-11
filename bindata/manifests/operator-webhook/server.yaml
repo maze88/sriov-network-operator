@@ -22,6 +22,8 @@ spec:
     metadata:
       labels:
         app: operator-webhook
+      annotations:
+        openshift.io/required-scc: restricted-v2
     spec:
       securityContext:
         runAsNonRoot: true
@@ -69,8 +71,7 @@ spec:
         - "--port=6443"
         - "--tls-private-key-file=/etc/tls/tls.key"
         - "--tls-cert-file=/etc/tls/tls.crt"
-        - "--alsologtostderr=true"
-        - "--v=3"
+        - "--zap-log-level=3"
         env:
         - name: NAMESPACE
           valueFrom:
@@ -81,6 +82,12 @@ spec:
         securityContext:
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
         resources:
           requests:
             cpu: 10m

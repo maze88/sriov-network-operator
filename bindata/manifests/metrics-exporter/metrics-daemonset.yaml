@@ -78,6 +78,9 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: status.hostIP
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
         resources:
           requests:
             cpu: 10m
@@ -88,7 +91,7 @@ spec:
             readOnly: true
       nodeSelector:
         {{- range $key, $value := .NodeSelectorField }}
-          {{ $key }}: {{ $value }}
+          {{ $key }}: "{{ $value }}"
         {{- end }}
       restartPolicy: Always
       volumes:

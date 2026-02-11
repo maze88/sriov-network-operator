@@ -11,7 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/remotecommand"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	testclient "github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/client"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/images"
@@ -26,7 +26,7 @@ func GetDefinition() *corev1.Pod {
 			GenerateName: "testpod-",
 			Namespace:    namespaces.Test},
 		Spec: corev1.PodSpec{
-			TerminationGracePeriodSeconds: pointer.Int64Ptr(0),
+			TerminationGracePeriodSeconds: ptr.To[int64](0),
 			Containers: []corev1.Container{{Name: "test",
 				Image: images.Test(),
 				SecurityContext: &corev1.SecurityContext{
@@ -117,7 +117,6 @@ func ExecCommand(cs *testclient.ClientSet, pod *corev1.Pod, command ...string) (
 			Command:   command,
 			Stdout:    true,
 			Stderr:    true,
-			TTY:       true,
 		}, scheme.ParameterCodec)
 
 	exec, err := remotecommand.NewSPDYExecutor(cs.Config, "POST", req.URL())
@@ -125,10 +124,9 @@ func ExecCommand(cs *testclient.ClientSet, pod *corev1.Pod, command ...string) (
 		return buf.String(), errbuf.String(), err
 	}
 
-	err = exec.Stream(remotecommand.StreamOptions{
+	err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
 		Stdout: &buf,
 		Stderr: &errbuf,
-		Tty:    true,
 	})
 	if err != nil {
 		return buf.String(), errbuf.String(), err

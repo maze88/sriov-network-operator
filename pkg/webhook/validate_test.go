@@ -6,17 +6,16 @@ import (
 	"os"
 	"testing"
 
-	corev1 "k8s.io/api/core/v1"
-
 	. "github.com/onsi/gomega"
+
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	. "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
 	constants "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
-
-	fakesnclientset "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/client/clientset/versioned/fake"
 )
 
 func TestMain(m *testing.M) {
@@ -168,7 +167,7 @@ func TestValidateSriovOperatorConfigWithDefaultOperatorConfig(t *testing.T) {
 	g := NewGomegaWithT(t)
 
 	config := newDefaultOperatorConfig()
-	snclient = fakesnclientset.NewSimpleClientset()
+	client = fake.NewClientBuilder().WithScheme(vars.Scheme).Build()
 
 	ok, w, err := validateSriovOperatorConfig(config, "DELETE")
 	g.Expect(err).NotTo(HaveOccurred())
@@ -202,10 +201,7 @@ func TestValidateSriovOperatorConfigDisableDrain(t *testing.T) {
 		},
 	}
 
-	snclient = fakesnclientset.NewSimpleClientset(
-		config,
-		nodeState,
-	)
+	client = fake.NewClientBuilder().WithScheme(vars.Scheme).WithObjects(config, nodeState).Build()
 
 	config.Spec.DisableDrain = true
 	ok, _, err := validateSriovOperatorConfig(config, "UPDATE")
@@ -214,8 +210,8 @@ func TestValidateSriovOperatorConfigDisableDrain(t *testing.T) {
 
 	// Simulate node update finished
 	nodeState.Status.SyncStatus = "Succeeded"
-	snclient.SriovnetworkV1().SriovNetworkNodeStates(namespace).
-		Update(context.Background(), nodeState, metav1.UpdateOptions{})
+	err = client.Update(context.Background(), nodeState)
+	g.Expect(err).ToNot(HaveOccurred())
 
 	ok, _, err = validateSriovOperatorConfig(config, "UPDATE")
 	g.Expect(err).NotTo(HaveOccurred())
@@ -226,11 +222,11 @@ func TestValidateSriovNetworkPoolConfigWithDefault(t *testing.T) {
 	g := NewGomegaWithT(t)
 
 	config := newDefaultNetworkPoolConfig()
-	snclient = fakesnclientset.NewSimpleClientset()
+	client = fake.NewClientBuilder().WithScheme(vars.Scheme).Build()
 
 	ok, _, err := validateSriovNetworkPoolConfig(config, "DELETE")
-	g.Expect(err).To(HaveOccurred())
-	g.Expect(ok).To(Equal(false))
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(ok).To(Equal(true))
 
 	ok, _, err = validateSriovNetworkPoolConfig(config, "UPDATE")
 	g.Expect(err).NotTo(HaveOccurred())
@@ -246,7 +242,7 @@ func TestValidateSriovNetworkPoolConfigWithParallelAndHWOffload(t *testing.T) {
 
 	config := newDefaultNetworkPoolConfig()
 	config.Spec.OvsHardwareOffloadConfig.Name = "test"
-	snclient = fakesnclientset.NewSimpleClientset()
+	client = fake.NewClientBuilder().WithScheme(vars.Scheme).Build()
 
 	ok, _, err := validateSriovNetworkPoolConfig(config, "UPDATE")
 	g.Expect(err).To(HaveOccurred())
@@ -1107,6 +1103,70 @@ func TestStaticValidateSriovNetworkNodePolicyWithInvalidNicSelector(t *testing.T
 	g.Expect(ok).To(Equal(false))
 }
 
+func TestStaticValidateSriovNetworkNodePolicyWithInvalidLinkTypeForSwitchdev(t *testing.T) {
+	policy := &SriovNetworkNodePolicy{
+		Spec: SriovNetworkNodePolicySpec{
+			DeviceType:  "netdevice",
+			LinkType:    "ib",
+			IsRdma:      true,
+			EswitchMode: "switchdev",
+			NicSelector: SriovNetworkNicSelector{
+				PfNames: []string{"ens803f1"},
+			},
+			NodeSelector: map[string]string{
+				"feature.node.kubernetes.io/network-sriov.capable": "true",
+			},
+			ResourceName: "p0",
+		},
+	}
+	g := NewGomegaWithT(t)
+	ok, err := staticValidateSriovNetworkNodePolicy(policy)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(ok).To(Equal(false))
+}
+
+func TestStaticValidateSriovNetworkNodePolicyWithBridgeConfigWithoutSwitchdev(t *testing.T) {
+	policy := &SriovNetworkNodePolicy{
+		Spec: SriovNetworkNodePolicySpec{
+			DeviceType: "netdevice",
+			Bridge:     Bridge{OVS: &OVSConfig{}},
+			NicSelector: SriovNetworkNicSelector{
+				PfNames: []string{"ens803f1"},
+			},
+			NodeSelector: map[string]string{
+				"feature.node.kubernetes.io/network-sriov.capable": "true",
+			},
+			ResourceName: "p0",
+		},
+	}
+	g := NewGomegaWithT(t)
+	ok, err := staticValidateSriovNetworkNodePolicy(policy)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(ok).To(Equal(false))
+}
+
+func TestStaticValidateSriovNetworkNodePolicyWithBridgeConfigWithExternallyManaged(t *testing.T) {
+	policy := &SriovNetworkNodePolicy{
+		Spec: SriovNetworkNodePolicySpec{
+			DeviceType:        "netdevice",
+			Bridge:            Bridge{OVS: &OVSConfig{}},
+			EswitchMode:       "switchdev",
+			ExternallyManaged: true,
+			NicSelector: SriovNetworkNicSelector{
+				PfNames: []string{"ens803f1"},
+			},
+			NodeSelector: map[string]string{
+				"feature.node.kubernetes.io/network-sriov.capable": "true",
+			},
+			ResourceName: "p0",
+		},
+	}
+	g := NewGomegaWithT(t)
+	ok, err := staticValidateSriovNetworkNodePolicy(policy)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(ok).To(Equal(false))
+}
+
 func TestValidatePolicyForNodeStateWithValidNetFilter(t *testing.T) {
 	interfaceSelected = false
 	state := newNodeState()
@@ -1153,15 +1213,15 @@ func TestValidatePolicyForNodeStateWithValidVFAndNetFilter(t *testing.T) {
 				{
 					VFs: []VirtualFunction{
 						{
-							DeviceID:   "154c",
+							DeviceID:   "158b",
 							Driver:     "iavf",
 							PciAddress: "0000:86:00.1",
 							Mtu:        1500,
 							VfID:       0,
 						},
 					},
-					DeviceID:   "154c",
-					Driver:     "iavf",
+					DeviceID:   "158b",
+					Driver:     "i40e",
 					Mtu:        1500,
 					Name:       "ens803f0",
 					PciAddress: "0000:86:00.0",

@@ -29,12 +29,24 @@ rules:
     verbs:
       - '*'
   - apiGroups:
-      - monitoring.coreos.com
+      - networking.k8s.io
     resources:
-      - servicemonitors
+      - networkpolicies
     verbs:
       - get
       - create
+      - update
+      - delete
+  - apiGroups:
+      - monitoring.coreos.com
+    resources:
+      - servicemonitors
+      - prometheusrules
+    verbs:
+      - get
+      - create
+      - update
+      - delete
   - apiGroups:
       - apps
     resourceNames:
@@ -79,13 +91,11 @@ rules:
     resources:
       - pods
     verbs:
-      - '*'
-  - apiGroups:
-      - apps
-    resources:
-      - daemonsets
-    verbs:
-      - '*'
+      - "get"
+      - "list"
+      - "watch"
+      - "delete"
+      - "patch"
   - apiGroups:
       - sriovnetwork.openshift.io
     resources:

@@ -27,7 +27,8 @@ WEBHOOK_IMAGE_TAG?=$(IMAGE_REPO)/$(APP_NAME)-webhook:latest
 MAIN_PKG=cmd/manager/main.go
 export NAMESPACE?=openshift-sriov-network-operator
 export WATCH_NAMESPACE?=openshift-sriov-network-operator
-export GOFLAGS+=-mod=vendor
+export HOME?=$(PWD)
+export GOPATH?=$(shell go env GOPATH)
 export GO111MODULE=on
 PKGS=$(shell go list ./... | grep -v -E '/vendor/|/test|/examples')
 TESTPKGS?=./...
@@ -52,14 +53,13 @@ GOLANGCI_LINT = $(BIN_DIR)/golangci-lint
 # golangci-lint version should be updated periodically
 # we keep it fixed to avoid it from unexpectedly failing on the project
 # in case of a version bump
-GOLANGCI_LINT_VER = v1.55.2
-
+GOLANGCI_LINT_VER = v2.7.2
 
 .PHONY: all build clean gendeepcopy test test-e2e test-e2e-k8s run image fmt sync-manifests test-e2e-conformance manifests update-codegen
 
 all: generate lint build
 
-build: manager _build-sriov-network-config-daemon _build-webhook
+build: manager _build-sriov-network-config-daemon _build-webhook _build-sriov-network-operator-config-cleanup
 
 _build-%:
 	WHAT=$* hack/build-go.sh
@@ -68,9 +68,6 @@ clean:
 	@rm -rf $(TARGET_DIR)
 	@rm -rf $(BIN_DIR)
 
-update-codegen:
-	hack/update-codegen.sh
-
 image: ; $(info Building images...)
 	$(IMAGE_BUILDER) build -f $(DOCKERFILE) -t $(IMAGE_TAG) $(CURPATH) $(IMAGE_BUILD_OPTS)
 	$(IMAGE_BUILDER) build -f $(DOCKERFILE_CONFIG_DAEMON) -t $(CONFIG_DAEMON_IMAGE_TAG) $(CURPATH) $(IMAGE_BUILD_OPTS)
@@ -78,7 +75,7 @@ image: ; $(info Building images...)
 
 # Run tests
 test: generate lint manifests envtest
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir=/tmp -p path)" HOME="$(shell pwd)" go test -coverprofile cover.out -v ${TESTPKGS}
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use --bin-dir=/tmp -p path)" HOME="$(shell pwd)" go test -coverprofile cover.out -v ${TESTPKGS}
 
 # Build manager binary
 manager: generate _build-manager
@@ -88,21 +85,12 @@ run: skopeo install
 	hack/run-locally.sh
 
 # Install CRDs into a cluster
-install: manifests kustomize
-	$(KUSTOMIZE) build config/crd | kubectl apply -f -
+install: manifests
+	kubectl apply -f $(CRD_BASES)
 
 # Uninstall CRDs from a cluster
-uninstall: manifests kustomize
-	$(KUSTOMIZE) build config/crd | kubectl delete --ignore-not-found -f -
-
-# Deploy controller in the configured Kubernetes cluster in ~/.kube/config
-# deploy: manifests kustomize
-# 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-# 	$(KUSTOMIZE) build config/default | kubectl apply -f -
-
-# UnDeploy controller from the configured Kubernetes cluster in ~/.kube/config
-# undeploy:
-# 	$(KUSTOMIZE) build config/default | kubectl delete -f -
+uninstall: manifests
+	kubectl delete --ignore-not-found -f $(CRD_BASES)
 
 # Generate manifests e.g. CRD, RBAC etc.
 manifests: controller-gen
@@ -112,7 +100,7 @@ manifests: controller-gen
 check-manifests: manifests
 	@set +e; git diff --quiet config; \
 	if [ $$? -eq 1 ]; \
-	then echo -e "\n`config` folder is out of date. Please run `make manifests` and commit your changes"; \
+	then echo -e "'config' folder is out of date. Please run 'make manifests' and commit your changes"; \
 	exit 1; fi
 
 sync-manifests-%: manifests
@@ -148,26 +136,26 @@ mock-generate: gomock
 
 CONTROLLER_GEN = $(BIN_DIR)/controller-gen
 controller-gen: ## Download controller-gen locally if necessary.
-	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen@v0.14.0)
-
-KUSTOMIZE = $(BIN_DIR)/kustomize
-kustomize: ## Download kustomize locally if necessary.
-	$(call go-install-tool,$(KUSTOMIZE),sigs.k8s.io/kustomize/kustomize/v4@v4.5.5)
+	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen@v0.20.0)
 
 ENVTEST = $(BIN_DIR)/setup-envtest
 envtest: ## Download envtest-setup locally if necessary.
-	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.16)
+	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.20)
 
 GOMOCK = $(shell pwd)/bin/mockgen
 gomock:
-	$(call go-install-tool,$(GOMOCK),github.com/golang/mock/mockgen@v1.6.0)
+	$(call go-install-tool,$(GOMOCK),go.uber.org/mock/mockgen@v0.6.0)
+
+GINKGO = $(BIN_DIR)/ginkgo
+ginkgo:
+	$(call go-install-tool,$(GINKGO),github.com/onsi/ginkgo/v2/ginkgo)
 
 # go-install-tool will 'go install' any package $2 and install it to $1.
 define go-install-tool
 @[ -f $(1) ] || { \
 set -e ;\
 echo "Downloading $(2)" ;\
-GOBIN=$(BIN_DIR) go install -mod=mod $(2) ;\
+GOBIN=$(BIN_DIR) go install $(2) ;\
 }
 endef
 
@@ -193,38 +181,38 @@ deploy-setup-k8s: export OPERATOR_EXEC=kubectl
 deploy-setup-k8s: export CLUSTER_TYPE=kubernetes
 deploy-setup-k8s: deploy-setup
 
-test-e2e-conformance:
+test-e2e-conformance: ginkgo
 	SUITE=./test/conformance ./hack/run-e2e-conformance.sh
 
-test-e2e-conformance-virtual-k8s-cluster-ci:
+test-e2e-conformance-virtual-k8s-cluster-ci: ginkgo
 	./hack/run-e2e-conformance-virtual-cluster.sh
 
-test-e2e-conformance-virtual-k8s-cluster:
+test-e2e-conformance-virtual-k8s-cluster: ginkgo
 	SKIP_DELETE=TRUE ./hack/run-e2e-conformance-virtual-cluster.sh
 
-test-e2e-conformance-virtual-ocp-cluster-ci:
+test-e2e-conformance-virtual-ocp-cluster-ci: ginkgo
 	./hack/run-e2e-conformance-virtual-ocp.sh
 
-test-e2e-conformance-virtual-ocp-cluster:
+test-e2e-conformance-virtual-ocp-cluster: ginkgo
 	SKIP_DELETE=TRUE ./hack/run-e2e-conformance-virtual-ocp.sh
 
 redeploy-operator-virtual-cluster:
 	./hack/virtual-cluster-redeploy.sh
 
-test-e2e-validation-only:
+test-e2e-validation-only: ginkgo
 	SUITE=./test/validation ./hack/run-e2e-conformance.sh	
 
 test-e2e: generate manifests skopeo envtest
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir=/tmp -p path)"; source hack/env.sh; HOME="$(shell pwd)" go test ./test/e2e/... -timeout 60m -coverprofile cover.out -v
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use --bin-dir=/tmp -p path)"; source hack/env.sh; HOME="$(shell pwd)" go test ./test/e2e/... -timeout 60m -coverprofile cover.out -v
 
 test-e2e-k8s: export NAMESPACE=sriov-network-operator
 test-e2e-k8s: test-e2e
 
 test-bindata-scripts: fakechroot
-	fakechroot ./test/scripts/enable-kargs_test.sh
+	fakechroot ./test/scripts/kargs_test.sh
 
 test-%: generate manifests envtest
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir=/tmp -p path)" HOME="$(shell pwd)" go test ./$*/... -coverprofile cover-$*.out -coverpkg ./... -v
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use --bin-dir=/tmp -p path)" HOME="$(shell pwd)" go test `go list ./$*/... | grep -v "/mock" | grep -v "/pkg/client"` -coverprofile cover-$*-$(CLUSTER_TYPE).out -coverpkg ./... -v
 
 GOCOVMERGE = $(BIN_DIR)/gocovmerge
 gocovmerge: ## Download gocovmerge locally if necessary.
@@ -249,17 +237,16 @@ undeploy-k8s: export OPERATOR_EXEC=kubectl
 undeploy-k8s: undeploy
 
 deps-update:
-	go mod tidy && \
-	go mod vendor
+	go mod tidy
 
 check-deps: deps-update
-	@set +e; git diff --quiet HEAD go.sum go.mod vendor; \
+	@set +e; git diff --quiet HEAD go.sum go.mod; \
 	if [ $$? -eq 1 ]; \
 	then echo -e "\ngo modules are out of date. Please commit after running 'make deps-update' command\n"; \
 	exit 1; fi
 
 $(GOLANGCI_LINT): ; $(info installing golangci-lint...)
-	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VER))
+	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VER))
 
 .PHONY: lint
 lint: | $(GOLANGCI_LINT) ; $(info  running golangci-lint...) @ ## Run golangci-lint
@@ -269,7 +256,7 @@ $(BIN_DIR):
 	@mkdir -p $(BIN_DIR)
 
 YQ=$(BIN_DIR)/yq
-YQ_VERSION=v4.44.1
+YQ_VERSION=v4.50.1
 $(YQ): | $(BIN_DIR); $(info installing yq)
 	@curl -fsSL -o $(YQ) https://github.com/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_linux_amd64 && chmod +x $(YQ)
 

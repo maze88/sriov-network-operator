@@ -10,11 +10,11 @@ spec:
     matchLabels:
       name: sriov-network-operator
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 33%
+    type: Recreate
   template:
     metadata:
+      annotations:
+        openshift.io/required-scc: restricted-v2
       labels:
         name: sriov-network-operator
     spec:
@@ -43,6 +43,15 @@ spec:
           image: {{ .Values.images.operator }}
           command:
             - sriov-network-operator
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
           resources:
             requests:
               cpu: 100m
@@ -58,6 +67,8 @@ spec:
               value: {{ .Values.images.ibSriovCni }}
             - name: OVS_CNI_IMAGE
               value: {{ .Values.images.ovsCni }}
+            - name: RDMA_CNI_IMAGE
+              value: {{ .Values.images.rdmaCni }}
             - name: SRIOV_DEVICE_PLUGIN_IMAGE
               value: {{ .Values.images.sriovDevicePlugin }}
             - name: NETWORK_RESOURCES_INJECTOR_IMAGE
@@ -76,6 +87,20 @@ spec:
               value: {{ .Values.operator.metricsExporter.certificates.secretName }}
             - name: METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE
               value: {{ .Values.images.metricsExporterKubeRbacProxy }}
+            {{- if .Values.operator.externalDrainer.enabled }}
+            - name: USE_EXTERNAL_DRAINER
+              value: {{ .Values.operator.externalDrainer.enabled | quote }}
+            {{- end }}
+            {{- if .Values.operator.metricsExporter.prometheusOperator.enabled }}
+            - name: METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED
+              value: {{ .Values.operator.metricsExporter.prometheusOperator.enabled | quote}}
+            - name: METRICS_EXPORTER_PROMETHEUS_DEPLOY_RULES
+              value: {{ .Values.operator.metricsExporter.prometheusOperator.deployRules | quote}}
+            - name: METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT
+              value: {{ .Values.operator.metricsExporter.prometheusOperator.serviceAccount }}
+            - name: METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE
+              value: {{ .Values.operator.metricsExporter.prometheusOperator.namespace }}
+            {{- end }}
             - name: RESOURCE_PREFIX
               value: {{ .Values.operator.resourcePrefix }}
             - name: IMAGE_PULL_SECRETS
@@ -98,7 +123,17 @@ spec:
               value: {{ .Values.operator.cniBinPath }}
             - name: CLUSTER_TYPE
               value: {{ .Values.operator.clusterType }}
+            - name: STALE_NODE_STATE_CLEANUP_DELAY_MINUTES
+              value: "{{ .Values.operator.staleNodeStateCleanupDelayMinutes }}"
+            {{- range $k, $v := .Values.operator.extraEnv }}
+            - name: {{ $k }}
+              value: {{ $v | toString | quote }}
+            {{- end }}
         {{- if .Values.operator.admissionControllers.enabled }}
+            - name: OPERATOR_WEBHOOK_NETWORK_POLICY_PORT
+              value: "{{ .Values.operator.admissionControllers.networkPolicy.operator.port }}"
+            - name: INJECTOR_WEBHOOK_NETWORK_POLICY_PORT
+              value: "{{ .Values.operator.admissionControllers.networkPolicy.injector.port }}"
             - name: ADMISSION_CONTROLLERS_CERTIFICATES_OPERATOR_SECRET_NAME
               value: {{ .Values.operator.admissionControllers.certificates.secretNames.operator }}
             - name: ADMISSION_CONTROLLERS_CERTIFICATES_INJECTOR_SECRET_NAME

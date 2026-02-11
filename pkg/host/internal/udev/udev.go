@@ -5,10 +5,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/host/types"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/utils"
@@ -23,7 +25,7 @@ func New(utilsHelper utils.CmdInterface) types.UdevInterface {
 	return &udev{utilsHelper: utilsHelper}
 }
 
-func (u *udev) PrepareNMUdevRule(supportedVfIds []string) error {
+func (u *udev) PrepareNMUdevRule() error {
 	log.Log.V(2).Info("PrepareNMUdevRule()")
 	filePath := filepath.Join(vars.FilesystemRoot, consts.HostUdevRulesFolder, "10-nm-unmanaged.rules")
 
@@ -45,7 +47,7 @@ func (u *udev) PrepareNMUdevRule(supportedVfIds []string) error {
 	log.Log.V(2).Info("PrepareNMUdevRule()", "stdout", stdout)
 
 	//save the device list to use for udev rules
-	vars.SupportedVfIds = supportedVfIds
+	vars.SupportedVfIds = sriovnetworkv1.GetSupportedVfIds()
 	return nil
 }
 
@@ -58,11 +60,11 @@ func (u *udev) PrepareVFRepUdevRule() error {
 		log.Log.Error(err, "PrepareVFRepUdevRule(): failed to read source for representor name UDEV script")
 		return err
 	}
-	if err := os.WriteFile(targetPath, data, 0755); err != nil {
+	if err := os.WriteFile(targetPath, data, 0o755); err != nil {
 		log.Log.Error(err, "PrepareVFRepUdevRule(): failed to write representor name UDEV script")
 		return err
 	}
-	if err := os.Chmod(targetPath, 0755); err != nil {
+	if err := os.Chmod(targetPath, 0o755); err != nil {
 		log.Log.Error(err, "PrepareVFRepUdevRule(): failed to set permissions on representor name UDEV script")
 		return err
 	}
@@ -121,6 +123,18 @@ func (u *udev) LoadUdevRules() error {
 	_, stderr, err = u.utilsHelper.RunCommand(udevAdmTool, "trigger", "--action", "add", "--attr-match", "subsystem=net")
 	if err != nil {
 		log.Log.Error(err, "LoadUdevRules(): failed to trigger rules", "error", stderr)
+		return err
+	}
+	return nil
+}
+
+// WaitUdevEventsProcessed calls `udevadm settle“ with provided timeout
+// The command watches the udev event queue, and exits if all current events are handled.
+func (u *udev) WaitUdevEventsProcessed(timeout int) error {
+	log.Log.V(2).Info("WaitUdevEventsProcessed()")
+	_, stderr, err := u.utilsHelper.RunCommand("udevadm", "settle", "-t", strconv.Itoa(timeout))
+	if err != nil {
+		log.Log.Error(err, "WaitUdevEventsProcessed(): failed to wait for udev rules to process", "error", stderr, "timeout", timeout)
 		return err
 	}
 	return nil

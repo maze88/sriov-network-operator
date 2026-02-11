@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -xeo pipefail
 
-OCP_VERSION=${OCP_VERSION:-4.16.0-rc.2}
+OCP_VERSION=${OCP_VERSION:-4.20.3}
+OCP_RELEASE_TYPE=${OCP_RELEASE_TYPE:-stable}
 cluster_name=${CLUSTER_NAME:-ocp-virt}
 domain_name=lab
 
 api_ip=${API_IP:-192.168.123.253}
 virtual_router_id=${VIRTUAL_ROUTER_ID:-253}
 registry="default-route-openshift-image-registry.apps.${cluster_name}.${domain_name}"
-HOME="/root"
 
 NUM_OF_WORKERS=${NUM_OF_WORKERS:-3}
 total_number_of_nodes=$((1 + NUM_OF_WORKERS))
@@ -42,6 +42,7 @@ kcli delete network $cluster_name -y
 function cleanup {
   kcli delete cluster $cluster_name -y
   kcli delete network $cluster_name -y
+  sudo rm -f /etc/containers/registries.conf.d/003-${cluster_name}.conf
 }
 
 if [ -z $SKIP_DELETE ]; then
@@ -52,6 +53,7 @@ kcli create network -c 192.168.123.0/24 ocp
 kcli create network -c 192.168.${virtual_router_id}.0/24 --nodhcp -i $cluster_name
 
 cat <<EOF > ./${cluster_name}-plan.yaml
+version: $OCP_RELEASE_TYPE
 tag: $OCP_VERSION
 ctlplane_memory: 32768
 worker_memory: 8192
@@ -65,7 +67,7 @@ ctlplanes: 1
 workers: $NUM_OF_WORKERS
 machine: q35
 network_type: OVNKubernetes
-pull_secret: /root/openshift_pull.json
+pull_secret: $HOME/openshift_pull.json
 vmrules:
   - $cluster_name-worker-.*:
       nets:
@@ -134,7 +136,7 @@ controller_ip=`kubectl get node -o wide | grep ctlp | awk '{print $6}'`
 
 if [ `cat /etc/hosts | grep ${api_ip} | grep "default-route-openshift-image-registry.apps.${cluster_name}.${domain_name}" | wc -l` == 0 ]; then
   echo "adding registry to hosts"
-  sed -i "s/${api_ip}/${api_ip} default-route-openshift-image-registry.apps.${cluster_name}.${domain_name}/g" /etc/hosts
+  sudo sed -i "s/${api_ip}/${api_ip} default-route-openshift-image-registry.apps.${cluster_name}.${domain_name}/g" /etc/hosts
 fi
 
 
@@ -181,6 +183,8 @@ kubectl patch configs.imageregistry.operator.openshift.io/cluster --patch '{"spe
 kubectl patch ingresscontrollers.operator.openshift.io/default -n openshift-ingress-operator --patch '{"spec":{"replicas": 1}}' --type=merge
 
 export ADMISSION_CONTROLLERS_ENABLED=true
+export OPERATOR_WEBHOOK_NETWORK_POLICY_PORT=${OPERATOR_WEBHOOK_NETWORK_POLICY_PORT:-"6443"}
+export INJECTOR_WEBHOOK_NETWORK_POLICY_PORT=${INJECTOR_WEBHOOK_NETWORK_POLICY_PORT:-"6443"}
 export SKIP_VAR_SET=""
 export NAMESPACE="openshift-sriov-network-operator"
 export OPERATOR_NAMESPACE=$NAMESPACE
@@ -189,7 +193,10 @@ export OPERATOR_EXEC=kubectl
 export CLUSTER_TYPE=openshift
 export DEV_MODE=TRUE
 export CLUSTER_HAS_EMULATED_PF=TRUE
-export OPERATOR_LEADER_ELECTION_ENABLE=true
+export METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED=true
+export METRICS_EXPORTER_PROMETHEUS_DEPLOY_RULES=true
+export METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT=${METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT:-"prometheus-k8s"}
+export METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE=${METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE:-"openshift-monitoring"}
 
 export SRIOV_NETWORK_OPERATOR_IMAGE="$registry/$NAMESPACE/sriov-network-operator:latest"
 export SRIOV_NETWORK_CONFIG_DAEMON_IMAGE="$registry/$NAMESPACE/sriov-network-config-daemon:latest"
@@ -212,7 +219,7 @@ DELAY_SECONDS=10
 retries=0
 until [ $retries -ge $MAX_RETRIES ]; do
   # wait for all the openshift cluster operators to be running
-  if [ $(kubectl get clusteroperator --no-headers | awk '{print $3}' | grep True | wc -l) -eq 33 ]; then
+  if [ $(kubectl get clusteroperator --no-headers | awk '{print $3}' | grep -v True | wc -l) -eq 0 ]; then
     break
   fi
   retries=$((retries+1))
@@ -237,7 +244,11 @@ echo ${auth} > registry-login.conf
 internal_registry="image-registry.openshift-image-registry.svc:5000"
 pass=$( jq .\"image-registry.openshift-image-registry.svc:5000\".auth registry-login.conf  )
 pass=`echo ${pass:1:-1} | base64 -d`
-podman login -u serviceaccount -p ${pass:15} $registry --tls-verify=false
+
+# dockercfg password is in the form `<token>:password`. We need to trim the `<token>:` prefix
+pass=${pass#"<token>:"}
+
+podman login -u serviceaccount -p ${pass} $registry --tls-verify=false
 
 MAX_RETRIES=20
 DELAY_SECONDS=10
@@ -268,7 +279,7 @@ podman rmi -fi ${SRIOV_NETWORK_WEBHOOK_IMAGE}
 podman logout $registry
 
 echo "## apply CRDs"
-kubectl apply -k $root/config/crd
+kubectl apply -f $root/config/crd/bases
 
 
 cat <<EOF | kubectl apply -f -

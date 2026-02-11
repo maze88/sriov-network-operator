@@ -1,15 +1,13 @@
 package virtual
 
 import (
-	"reflect"
-
+	"k8s.io/apimachinery/pkg/api/equality"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
 	consts "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/helper"
 	plugin "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/plugins"
-	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
 )
 
 var PluginName = "virtual"
@@ -34,7 +32,6 @@ const (
 func NewVirtualPlugin(helper helper.HostHelpersInterface) (plugin.VendorPlugin, error) {
 	return &VirtualPlugin{
 		PluginName:     PluginName,
-		SpecVersion:    "1.0",
 		LoadVfioDriver: unloaded,
 		helpers:        helper,
 	}, nil
@@ -45,17 +42,9 @@ func (p *VirtualPlugin) Name() string {
 	return p.PluginName
 }
 
-// Spec returns the version of the spec expected by the plugin
-func (p *VirtualPlugin) Spec() string {
-	return p.SpecVersion
-}
-
 // OnNodeStateChange Invoked when SriovNetworkNodeState CR is created or updated, return if need dain and/or reboot node
-func (p *VirtualPlugin) OnNodeStateChange(new *sriovnetworkv1.SriovNetworkNodeState) (needDrain bool, needReboot bool, err error) {
+func (p *VirtualPlugin) OnNodeStateChange(new *sriovnetworkv1.SriovNetworkNodeState) (bool, bool, error) {
 	log.Log.Info("virtual plugin OnNodeStateChange()")
-	needDrain = false
-	needReboot = false
-	err = nil
 	p.DesireState = new
 
 	if p.LoadVfioDriver != loaded {
@@ -64,7 +53,50 @@ func (p *VirtualPlugin) OnNodeStateChange(new *sriovnetworkv1.SriovNetworkNodeSt
 		}
 	}
 
-	return
+	return p.needDrainNode(new.Spec, new.Status), false, nil
+}
+
+func (p *VirtualPlugin) needDrainNode(desired sriovnetworkv1.SriovNetworkNodeStateSpec, current sriovnetworkv1.SriovNetworkNodeStateStatus) bool {
+	log.Log.V(2).Info("virtual plugin needDrainNode()", "current", current, "desired", desired)
+	for _, ifaceStatus := range current.Interfaces {
+		configured := false
+		for _, iface := range desired.Interfaces {
+			if iface.PciAddress == ifaceStatus.PciAddress {
+				configured = true
+				break
+			}
+		}
+
+		// if the interface is not configured, but it was before by the sriov operator, we need to drain the node
+		if !configured {
+			// load the PF info
+			pfStatus, exist, err := p.helpers.LoadPfsStatus(ifaceStatus.PciAddress)
+			if err != nil {
+				log.Log.Error(err, "virtual plugin needDrainNode(): failed to load info about PF status for pci device",
+					"address", ifaceStatus.PciAddress)
+				continue
+			}
+
+			if !exist {
+				log.Log.Info("virtual plugin needDrainNode(): PF name with pci address has VFs configured but they weren't created by the sriov operator. Skipping drain",
+					"name", ifaceStatus.Name,
+					"address", ifaceStatus.PciAddress)
+				continue
+			}
+
+			if pfStatus.ExternallyManaged {
+				log.Log.Info("virtual plugin needDrainNode(): PF name with pci address was externally created. Skipping drain",
+					"name", ifaceStatus.Name,
+					"address", ifaceStatus.PciAddress)
+				continue
+			}
+
+			log.Log.V(2).Info("virtual plugin needDrainNode(): need drain since interface needs to be reset",
+				"interface", ifaceStatus)
+			return true
+		}
+	}
+	return false
 }
 
 // OnNodeStatusChange verify whether SriovNetworkNodeState CR status present changes on configured VFs.
@@ -96,7 +128,7 @@ func (p *VirtualPlugin) Apply() error {
 
 	if p.LastState != nil {
 		log.Log.Info("virtual plugin Apply()", "last-state", p.LastState.Spec)
-		if reflect.DeepEqual(p.LastState.Spec.Interfaces, p.DesireState.Spec.Interfaces) {
+		if equality.Semantic.DeepEqual(p.LastState.Spec.Interfaces, p.DesireState.Spec.Interfaces) {
 			log.Log.Info("virtual plugin Apply(): nothing to apply")
 			return nil
 		}
@@ -106,7 +138,7 @@ func (p *VirtualPlugin) Apply() error {
 		return err
 	}
 	defer exit()
-	if err := syncNodeStateVirtual(p.DesireState, p.helpers); err != nil {
+	if err := p.helpers.ConfigSriovDevicesVirtual(p.helpers, p.DesireState.Spec.Interfaces, p.DesireState.Status.Interfaces); err != nil {
 		return err
 	}
 	p.LastState = &sriovnetworkv1.SriovNetworkNodeState{}
@@ -115,72 +147,10 @@ func (p *VirtualPlugin) Apply() error {
 	return nil
 }
 
-func (p *VirtualPlugin) SetSystemdFlag() {
-}
-
-func (p *VirtualPlugin) IsSystemService() bool {
-	return false
-}
-
 func needVfioDriver(state *sriovnetworkv1.SriovNetworkNodeState) bool {
 	for _, iface := range state.Spec.Interfaces {
 		for i := range iface.VfGroups {
 			if iface.VfGroups[i].DeviceType == consts.DeviceTypeVfioPci {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// syncNodeStateVirtual attempt to update the node state to match the desired state in virtual platforms
-func syncNodeStateVirtual(newState *sriovnetworkv1.SriovNetworkNodeState, helpers helper.HostHelpersInterface) error {
-	var err error
-	for _, ifaceStatus := range newState.Status.Interfaces {
-		for _, iface := range newState.Spec.Interfaces {
-			if iface.PciAddress == ifaceStatus.PciAddress {
-				if !needUpdateVirtual(&iface, &ifaceStatus) {
-					log.Log.V(2).Info("syncNodeStateVirtual(): no need update interface", "address", iface.PciAddress)
-					break
-				}
-				if err = helpers.ConfigSriovDeviceVirtual(&iface); err != nil {
-					log.Log.Error(err, "syncNodeStateVirtual(): fail to config sriov interface", "address", iface.PciAddress)
-					return err
-				}
-				break
-			}
-		}
-	}
-	return nil
-}
-
-func needUpdateVirtual(iface *sriovnetworkv1.Interface, ifaceStatus *sriovnetworkv1.InterfaceExt) bool {
-	// The device MTU is set by the platform
-	// The NumVfs is always 1
-	if iface.NumVfs > 0 {
-		for _, vf := range ifaceStatus.VFs {
-			ingroup := false
-			for _, group := range iface.VfGroups {
-				if sriovnetworkv1.IndexInRange(vf.VfID, group.VfRange) {
-					ingroup = true
-					if group.DeviceType != consts.DeviceTypeNetDevice {
-						if group.DeviceType != vf.Driver {
-							log.Log.V(2).Info("needUpdateVirtual(): Driver needs update",
-								"desired", group.DeviceType, "current", vf.Driver)
-							return true
-						}
-					} else {
-						if sriovnetworkv1.StringInArray(vf.Driver, vars.DpdkDrivers) {
-							log.Log.V(2).Info("needUpdateVirtual(): Driver needs update",
-								"desired", group.DeviceType, "current", vf.Driver)
-							return true
-						}
-					}
-					break
-				}
-			}
-			if !ingroup && sriovnetworkv1.StringInArray(vf.Driver, vars.DpdkDrivers) {
-				// VF which has DPDK driver loaded but not in any group, needs to be reset to default driver.
 				return true
 			}
 		}

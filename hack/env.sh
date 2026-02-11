@@ -1,8 +1,12 @@
+#!/bin/bash
+
 if [ -z $SKIP_VAR_SET ]; then
         export SRIOV_CNI_IMAGE=${SRIOV_CNI_IMAGE:-ghcr.io/k8snetworkplumbingwg/sriov-cni}
         export SRIOV_INFINIBAND_CNI_IMAGE=${SRIOV_INFINIBAND_CNI_IMAGE:-ghcr.io/k8snetworkplumbingwg/ib-sriov-cni}
         # OVS_CNI_IMAGE can be explicitly set to empty value, use default only if the var is not set
         export OVS_CNI_IMAGE=${OVS_CNI_IMAGE-ghcr.io/k8snetworkplumbingwg/ovs-cni-plugin}
+        # RDMA_CNI_IMAGE can be explicitly set to empty value, use default only if the var is not set
+        export RDMA_CNI_IMAGE=${RDMA_CNI_IMAGE-ghcr.io/k8snetworkplumbingwg/rdma-cni}
         export SRIOV_DEVICE_PLUGIN_IMAGE=${SRIOV_DEVICE_PLUGIN_IMAGE:-ghcr.io/k8snetworkplumbingwg/sriov-network-device-plugin}
         export NETWORK_RESOURCES_INJECTOR_IMAGE=${NETWORK_RESOURCES_INJECTOR_IMAGE:-ghcr.io/k8snetworkplumbingwg/network-resources-injector}
         export SRIOV_NETWORK_CONFIG_DAEMON_IMAGE=${SRIOV_NETWORK_CONFIG_DAEMON_IMAGE:-ghcr.io/k8snetworkplumbingwg/sriov-network-operator-config-daemon}
@@ -10,19 +14,26 @@ if [ -z $SKIP_VAR_SET ]; then
         export METRICS_EXPORTER_IMAGE=${METRICS_EXPORTER_IMAGE:-ghcr.io/k8snetworkplumbingwg/sriov-network-metrics-exporter}
         export SRIOV_NETWORK_OPERATOR_IMAGE=${SRIOV_NETWORK_OPERATOR_IMAGE:-ghcr.io/k8snetworkplumbingwg/sriov-network-operator}
         export METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE=${METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE:-gcr.io/kubebuilder/kube-rbac-proxy:v0.15.0}
+        fail_msg_detect="is empty and failed to detect"
 else
-        # ensure that OVS_CNI_IMAGE is set, empty string is a valid value
-        OVS_CNI_IMAGE=${OVS_CNI_IMAGE:-}
-        METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE=${METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE:-}
-        [ -z $SRIOV_CNI_IMAGE ] && echo "SRIOV_CNI_IMAGE is empty but SKIP_VAR_SET is set" && exit 1
-        [ -z $SRIOV_INFINIBAND_CNI_IMAGE ] && echo "SRIOV_INFINIBAND_CNI_IMAGE is empty but SKIP_VAR_SET is set" && exit 1
-        [ -z $SRIOV_DEVICE_PLUGIN_IMAGE ] && echo "SRIOV_DEVICE_PLUGIN_IMAGE is empty but SKIP_VAR_SET is set" && exit 1
-        [ -z $NETWORK_RESOURCES_INJECTOR_IMAGE ] && echo "NETWORK_RESOURCES_INJECTOR_IMAGE is empty but SKIP_VAR_SET is set" && exit 1
-        [ -z $SRIOV_NETWORK_CONFIG_DAEMON_IMAGE ] && echo "SRIOV_NETWORK_CONFIG_DAEMON_IMAGE is empty but SKIP_VAR_SET is set" && exit 1
-        [ -z $SRIOV_NETWORK_WEBHOOK_IMAGE ] && echo "SRIOV_NETWORK_WEBHOOK_IMAGE is empty but SKIP_VAR_SET is set" && exit 1
-        [ -z $METRICS_EXPORTER_IMAGE ] && echo "METRICS_EXPORTER_IMAGE is empty but SKIP_VAR_SET is set" && exit 1
-        [ -z $SRIOV_NETWORK_OPERATOR_IMAGE ] && echo "SRIOV_NETWORK_OPERATOR_IMAGE is empty but SKIP_VAR_SET is set" && exit 1
+        fail_msg_detect="is empty but SKIP_VAR_SET is set"
 fi
+
+# ensure that OVS_CNI_IMAGE is set, empty string is a valid value
+OVS_CNI_IMAGE=${OVS_CNI_IMAGE:-}
+# ensure that RDMA_CNI_IMAGE is set, empty string is a valid value
+RDMA_CNI_IMAGE=${RDMA_CNI_IMAGE:-}
+METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE=${METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE:-}
+[ -z $SRIOV_CNI_IMAGE ] && echo "SRIOV_CNI_IMAGE $fail_msg_detect" && exit 1
+[ -z $SRIOV_INFINIBAND_CNI_IMAGE ] && echo "SRIOV_INFINIBAND_CNI_IMAGE $fail_msg_detect" && exit 1
+[ -z $SRIOV_DEVICE_PLUGIN_IMAGE ] && echo "SRIOV_DEVICE_PLUGIN_IMAGE $fail_msg_detect" && exit 1
+[ -z $NETWORK_RESOURCES_INJECTOR_IMAGE ] && echo "NETWORK_RESOURCES_INJECTOR_IMAGE $fail_msg_detect" && exit 1
+[ -z $SRIOV_NETWORK_CONFIG_DAEMON_IMAGE ] && echo "SRIOV_NETWORK_CONFIG_DAEMON_IMAGE $fail_msg_detect" && exit 1
+[ -z $SRIOV_NETWORK_WEBHOOK_IMAGE ] && echo "SRIOV_NETWORK_WEBHOOK_IMAGE $fail_msg_detect" && exit 1
+[ -z $METRICS_EXPORTER_IMAGE ] && echo "METRICS_EXPORTER_IMAGE $fail_msg_detect" && exit 1
+[ -z $SRIOV_NETWORK_OPERATOR_IMAGE ] && echo "SRIOV_NETWORK_OPERATOR_IMAGE $fail_msg_detect" && exit 1
+
+unset fail_msg_detect
 
 set -x
 
@@ -38,6 +49,7 @@ export ADMISSION_CONTROLLERS_CERTIFICATES_CERT_MANAGER_ENABLED=${ADMISSION_CONTR
 export ADMISSION_CONTROLLERS_CERTIFICATES_OPERATOR_CA_CRT=${ADMISSION_CONTROLLERS_CERTIFICATES_OPERATOR_CA_CRT:-""}
 export ADMISSION_CONTROLLERS_CERTIFICATES_INJECTOR_CA_CRT=${ADMISSION_CONTROLLERS_CERTIFICATES_INJECTOR_CA_CRT:-""}
 export DEV_MODE=${DEV_MODE:-"FALSE"}
-export OPERATOR_LEADER_ELECTION_ENABLE=${OPERATOR_LEADER_ELECTION_ENABLE:-"false"}
 export METRICS_EXPORTER_SECRET_NAME=${METRICS_EXPORTER_SECRET_NAME:-"metrics-exporter-cert"}
 export METRICS_EXPORTER_PORT=${METRICS_EXPORTER_PORT:-"9110"}
+export OPERATOR_WEBHOOK_NETWORK_POLICY_PORT=${OPERATOR_WEBHOOK_NETWORK_POLICY_PORT:-"6443"}
+export INJECTOR_WEBHOOK_NETWORK_POLICY_PORT=${INJECTOR_WEBHOOK_NETWORK_POLICY_PORT:-"6443"}

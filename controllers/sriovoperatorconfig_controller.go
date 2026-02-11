@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -28,6 +29,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -38,24 +40,26 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	machinev1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
+	"github.com/go-logr/logr"
+	machinev1 "github.com/openshift/api/machineconfiguration/v1"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
-	apply "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/apply"
-	consts "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/apply"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/featuregate"
 	snolog "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/log"
-	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/platforms"
-	render "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/render"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/orchestrator"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/render"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
 )
 
 // SriovOperatorConfigReconciler reconciles a SriovOperatorConfig object
 type SriovOperatorConfigReconciler struct {
 	client.Client
-	Scheme         *runtime.Scheme
-	PlatformHelper platforms.Interface
-	FeatureGate    featuregate.FeatureGate
+	Scheme            *runtime.Scheme
+	Orchestrator      orchestrator.Interface
+	FeatureGate       featuregate.FeatureGate
+	UncachedAPIReader client.Reader
 }
 
 //+kubebuilder:rbac:groups=sriovnetwork.openshift.io,resources=sriovoperatorconfigs,verbs=get;list;watch;create;update;patch;delete
@@ -89,6 +93,16 @@ func (r *SriovOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.
 	}
 
 	snolog.SetLogLevel(defaultConfig.Spec.LogLevel)
+
+	// examine DeletionTimestamp to determine if object is under deletion
+	if !defaultConfig.ObjectMeta.DeletionTimestamp.IsZero() {
+		// The object is being deleted
+		return r.handleSriovOperatorConfigDeletion(ctx, defaultConfig, logger)
+	}
+
+	if err = r.syncOperatorConfigFinalizers(ctx, defaultConfig, logger); err != nil {
+		return reconcile.Result{}, err
+	}
 
 	r.FeatureGate.Init(defaultConfig.Spec.FeatureGates)
 	logger.Info("enabled featureGates", "featureGates", r.FeatureGate.String())
@@ -124,7 +138,7 @@ func (r *SriovOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.
 		return reconcile.Result{}, err
 	}
 
-	if err = syncPluginDaemonObjs(ctx, r.Client, r.Scheme, defaultConfig, policyList); err != nil {
+	if err = syncPluginDaemonObjs(ctx, r.Client, r.Scheme, defaultConfig, r.FeatureGate); err != nil {
 		return reconcile.Result{}, err
 	}
 
@@ -133,9 +147,9 @@ func (r *SriovOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.
 	}
 
 	// For Openshift we need to create the systemd files using a machine config
-	if vars.ClusterType == consts.ClusterTypeOpenshift {
+	if r.Orchestrator.ClusterType() == consts.ClusterTypeOpenshift {
 		// TODO: add support for hypershift as today there is no MCO on hypershift clusters
-		if r.PlatformHelper.IsHypershift() {
+		if r.Orchestrator.Flavor() == consts.ClusterFlavorHypershift {
 			return ctrl.Result{}, fmt.Errorf("systemd mode is not supported on hypershift")
 		}
 
@@ -178,9 +192,11 @@ func (r *SriovOperatorConfigReconciler) syncConfigDaemonSet(ctx context.Context,
 	data.Data["SRIOVCNIImage"] = os.Getenv("SRIOV_CNI_IMAGE")
 	data.Data["SRIOVInfiniBandCNIImage"] = os.Getenv("SRIOV_INFINIBAND_CNI_IMAGE")
 	data.Data["OVSCNIImage"] = os.Getenv("OVS_CNI_IMAGE")
+	data.Data["RDMACNIImage"] = os.Getenv("RDMA_CNI_IMAGE")
 	data.Data["ReleaseVersion"] = os.Getenv("RELEASEVERSION")
 	data.Data["ClusterType"] = vars.ClusterType
 	data.Data["DevMode"] = os.Getenv("DEV_MODE")
+	data.Data["UseExternalDrainer"] = vars.UseExternalDrainer
 	data.Data["ImagePullSecrets"] = GetImagePullSecrets()
 	if dc.Spec.ConfigurationMode == sriovnetworkv1.SystemdConfigurationMode {
 		data.Data["UsedSystemdMode"] = true
@@ -188,6 +204,7 @@ func (r *SriovOperatorConfigReconciler) syncConfigDaemonSet(ctx context.Context,
 		data.Data["UsedSystemdMode"] = false
 	}
 	data.Data["ParallelNicConfig"] = r.FeatureGate.IsEnabled(consts.ParallelNicConfigFeatureGate)
+	data.Data["ManageSoftwareBridges"] = r.FeatureGate.IsEnabled(consts.ManageSoftwareBridgesFeatureGate)
 
 	envCniBinPath := os.Getenv("SRIOV_CNI_BIN_PATH")
 	if envCniBinPath == "" {
@@ -201,6 +218,8 @@ func (r *SriovOperatorConfigReconciler) syncConfigDaemonSet(ctx context.Context,
 		logger.V(1).Info("DisablePlugins provided", "DisablePlugins", dc.Spec.DisablePlugins)
 		data.Data["DisablePlugins"] = strings.Join(dc.Spec.DisablePlugins.ToStringSlice(), ",")
 	}
+
+	data.Data["ConfigDaemonEnvVars"] = dc.Spec.ConfigDaemonEnvVars
 
 	objs, err := render.RenderDir(consts.ConfigDaemonPath, &data)
 	if err != nil {
@@ -236,7 +255,14 @@ func (r *SriovOperatorConfigReconciler) syncMetricsExporter(ctx context.Context,
 	data.Data["MetricsExporterSecretName"] = os.Getenv("METRICS_EXPORTER_SECRET_NAME")
 	data.Data["MetricsExporterPort"] = os.Getenv("METRICS_EXPORTER_PORT")
 	data.Data["MetricsExporterKubeRbacProxyImage"] = os.Getenv("METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE")
-	data.Data["ClusterType"] = vars.ClusterType
+
+	data.Data["IsOpenshift"] = r.Orchestrator.ClusterType() == consts.ClusterTypeOpenshift
+
+	data.Data["IsPrometheusOperatorInstalled"] = strings.ToLower(os.Getenv("METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED")) == trueString
+	data.Data["PrometheusOperatorDeployRules"] = strings.ToLower(os.Getenv("METRICS_EXPORTER_PROMETHEUS_DEPLOY_RULES")) == trueString
+	data.Data["PrometheusOperatorServiceAccount"] = os.Getenv("METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT")
+	data.Data["PrometheusOperatorNamespace"] = os.Getenv("METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE")
+
 	data.Data["NodeSelectorField"] = GetDefaultNodeSelector()
 	if dc.Spec.ConfigDaemonNodeSelector != nil {
 		data.Data["NodeSelectorField"] = dc.Spec.ConfigDaemonNodeSelector
@@ -248,8 +274,7 @@ func (r *SriovOperatorConfigReconciler) syncMetricsExporter(ctx context.Context,
 		return err
 	}
 
-	deployMetricsExporter, ok := dc.Spec.FeatureGates[consts.MetricsExporterFeatureGate]
-	if ok && deployMetricsExporter {
+	if r.FeatureGate.IsEnabled(consts.MetricsExporterFeatureGate) {
 		for _, obj := range objs {
 			err = r.syncK8sResource(ctx, dc, obj)
 			if err != nil {
@@ -257,14 +282,13 @@ func (r *SriovOperatorConfigReconciler) syncMetricsExporter(ctx context.Context,
 				return err
 			}
 		}
+
 		return nil
 	}
 
-	for _, obj := range objs {
-		err = r.deleteK8sResource(ctx, obj)
-		if err != nil {
-			return err
-		}
+	err = r.deleteK8sResources(ctx, objs)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -291,10 +315,22 @@ func (r *SriovOperatorConfigReconciler) syncWebhookObjs(ctx context.Context, dc 
 		data.Data["InjectorWebhookSecretName"] = os.Getenv("ADMISSION_CONTROLLERS_CERTIFICATES_INJECTOR_SECRET_NAME")
 		data.Data["InjectorWebhookCA"] = os.Getenv("ADMISSION_CONTROLLERS_CERTIFICATES_INJECTOR_CA_CRT")
 
+		operatorWebhookPort := os.Getenv("OPERATOR_WEBHOOK_NETWORK_POLICY_PORT")
+		if operatorWebhookPort == "" {
+			operatorWebhookPort = "6443"
+		}
+		data.Data["OperatorWebhookNetworkPolicyPort"] = operatorWebhookPort
+
+		injectorWebhookPort := os.Getenv("INJECTOR_WEBHOOK_NETWORK_POLICY_PORT")
+		if injectorWebhookPort == "" {
+			injectorWebhookPort = "6443"
+		}
+		data.Data["InjectorWebhookNetworkPolicyPort"] = injectorWebhookPort
+
 		data.Data["ExternalControlPlane"] = false
-		if r.PlatformHelper.IsOpenshiftCluster() {
-			external := r.PlatformHelper.IsHypershift()
-			data.Data["ExternalControlPlane"] = external
+		if r.Orchestrator.ClusterType() == consts.ClusterTypeOpenshift &&
+			r.Orchestrator.Flavor() == consts.ClusterFlavorHypershift {
+			data.Data["ExternalControlPlane"] = true
 		}
 
 		// check for ResourceInjectorMatchConditionFeatureGate feature gate
@@ -360,6 +396,16 @@ func (r *SriovOperatorConfigReconciler) deleteK8sResource(ctx context.Context, i
 	return nil
 }
 
+func (r *SriovOperatorConfigReconciler) deleteK8sResources(ctx context.Context, objs []*uns.Unstructured) error {
+	for _, obj := range objs {
+		err := r.deleteK8sResource(ctx, obj)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *SriovOperatorConfigReconciler) syncK8sResource(ctx context.Context, cr *sriovnetworkv1.SriovOperatorConfig, in *uns.Unstructured) error {
 	switch in.GetKind() {
 	case clusterRoleResourceName, clusterRoleBindingResourceName, mutatingWebhookConfigurationCRDName, validatingWebhookConfigurationCRDName, machineConfigCRDName:
@@ -381,7 +427,8 @@ func (r *SriovOperatorConfigReconciler) syncOpenShiftSystemdService(ctx context.
 
 	if cr.Spec.ConfigurationMode != sriovnetworkv1.SystemdConfigurationMode {
 		obj := &machinev1.MachineConfig{}
-		err := r.Get(context.TODO(), types.NamespacedName{Name: consts.SystemdServiceOcpMachineConfigName}, obj)
+		// use uncached api reader to get machineconfig to reduce memory footprint
+		err := r.UncachedAPIReader.Get(ctx, types.NamespacedName{Name: consts.SystemdServiceOcpMachineConfigName}, obj)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil
@@ -392,7 +439,7 @@ func (r *SriovOperatorConfigReconciler) syncOpenShiftSystemdService(ctx context.
 		}
 
 		logger.Info("Systemd service was deployed but the operator is now operating on daemonset mode, removing the machine config")
-		err = r.Delete(context.TODO(), obj)
+		err = r.Delete(ctx, obj)
 		if err != nil {
 			logger.Error(err, "failed to remove the systemd service machine config")
 			return err
@@ -412,6 +459,50 @@ func (r *SriovOperatorConfigReconciler) syncOpenShiftSystemdService(ctx context.
 
 	// Sync machine config
 	return r.setLabelInsideObject(ctx, cr, objs)
+}
+
+func (r SriovOperatorConfigReconciler) syncOperatorConfigFinalizers(ctx context.Context, defaultConfig *sriovnetworkv1.SriovOperatorConfig, logger logr.Logger) error {
+	if sriovnetworkv1.StringInArray(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers) {
+		return nil
+	}
+
+	newObj := defaultConfig.DeepCopyObject().(client.Object)
+	newObj.SetFinalizers(
+		append(newObj.GetFinalizers(), sriovnetworkv1.OPERATORCONFIGFINALIZERNAME),
+	)
+
+	logger.WithName("syncOperatorConfigFinalizers").
+		Info("Adding finalizer", "key", sriovnetworkv1.OPERATORCONFIGFINALIZERNAME)
+
+	patch := client.MergeFrom(defaultConfig)
+	err := r.Patch(ctx, newObj, patch)
+	if err != nil {
+		return fmt.Errorf("can't patch SriovOperatorConfig to add finalizer [%s]: %w", sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, err)
+	}
+
+	// Refresh the defaultConfig object with the latest changes
+	return r.Get(ctx, types.NamespacedName{Namespace: defaultConfig.Namespace, Name: defaultConfig.Name}, defaultConfig)
+}
+
+func (r *SriovOperatorConfigReconciler) handleSriovOperatorConfigDeletion(ctx context.Context,
+	defaultConfig *sriovnetworkv1.SriovOperatorConfig, logger logr.Logger) (ctrl.Result, error) {
+	var err error
+	if sriovnetworkv1.StringInArray(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers) {
+		// our finalizer is present, so lets handle any external dependency
+		logger.Info("delete SriovOperatorConfig CR", "Namespace", defaultConfig.Namespace, "Name", defaultConfig.Name)
+		// make sure webhooks objects are deleted prior of removing finalizer
+		err = r.deleteAllWebhooks(ctx)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		// remove our finalizer from the list and update it.
+		defaultConfig.ObjectMeta.Finalizers, _ = sriovnetworkv1.RemoveString(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers)
+		if err := r.Update(ctx, defaultConfig); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
+	return reconcile.Result{}, err
 }
 
 func (r SriovOperatorConfigReconciler) setLabelInsideObject(ctx context.Context, cr *sriovnetworkv1.SriovOperatorConfig, objs []*uns.Unstructured) error {
@@ -440,4 +531,30 @@ func (r SriovOperatorConfigReconciler) setLabelInsideObject(ctx context.Context,
 	}
 
 	return nil
+}
+
+func (r SriovOperatorConfigReconciler) deleteAllWebhooks(ctx context.Context) error {
+	var err error
+	obj := &uns.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Kind: "MutatingWebhookConfiguration", Version: "v1"})
+	obj.SetName(consts.OperatorWebHookName)
+	err = errors.Join(
+		err, r.deleteWebhookObject(ctx, obj),
+	)
+
+	obj = &uns.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Kind: "ValidatingWebhookConfiguration", Version: "v1"})
+	obj.SetName(consts.OperatorWebHookName)
+	err = errors.Join(
+		err, r.deleteWebhookObject(ctx, obj),
+	)
+
+	obj = &uns.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Kind: "MutatingWebhookConfiguration", Version: "v1"})
+	obj.SetName(consts.InjectorWebHookName)
+	err = errors.Join(
+		err, r.deleteWebhookObject(ctx, obj),
+	)
+
+	return err
 }

@@ -19,10 +19,30 @@ if [ $CLUSTER_TYPE == "openshift" ]; then
   echo ${auth} > registry-login.conf
 
   internal_registry="image-registry.openshift-image-registry.svc:5000"
-  pass=$( jq .\"$internal_registry\".password registry-login.conf )
+  pass=$( jq .\"image-registry.openshift-image-registry.svc:5000\".auth registry-login.conf  )
+  pass=`echo ${pass:1:-1} | base64 -d`
 
-  registry="default-route-openshift-image-registry.apps.${cluster_name}.${domain_name}"
-  podman login -u serviceaccount -p ${pass:1:-1} $registry --tls-verify=false
+  # dockercfg password is in the form `<token>:password`. We need to trim the `<token>:` prefix
+  pass=${pass#"<token>:"}
+
+  registry=`kubectl -n openshift-image-registry get route --no-headers | awk '{print $2}'`
+  podman login -u serviceaccount -p ${pass} $registry --tls-verify=false
+
+  export ADMISSION_CONTROLLERS_ENABLED=true
+  export OPERATOR_WEBHOOK_NETWORK_POLICY_PORT=${OPERATOR_WEBHOOK_NETWORK_POLICY_PORT:-"6443"}
+  export INJECTOR_WEBHOOK_NETWORK_POLICY_PORT=${INJECTOR_WEBHOOK_NETWORK_POLICY_PORT:-"6443"}
+  export SKIP_VAR_SET=""
+  export NAMESPACE="openshift-sriov-network-operator"
+  export OPERATOR_NAMESPACE=$NAMESPACE
+  export MULTUS_NAMESPACE="openshift-multus"
+  export OPERATOR_EXEC=kubectl
+  export CLUSTER_TYPE=openshift
+  export DEV_MODE=TRUE
+  export CLUSTER_HAS_EMULATED_PF=TRUE
+  export METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED=true
+  export METRICS_EXPORTER_PROMETHEUS_DEPLOY_RULES=true
+  export METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT=${METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT:-"prometheus-k8s"}
+  export METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE=${METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE:-"openshift-monitoring"}
 
   export SRIOV_NETWORK_OPERATOR_IMAGE="$registry/$NAMESPACE/sriov-network-operator:latest"
   export SRIOV_NETWORK_CONFIG_DAEMON_IMAGE="$registry/$NAMESPACE/sriov-network-config-daemon:latest"
@@ -44,6 +64,8 @@ else
 fi
 
 export ADMISSION_CONTROLLERS_ENABLED=true
+export OPERATOR_WEBHOOK_NETWORK_POLICY_PORT=${OPERATOR_WEBHOOK_NETWORK_POLICY_PORT:-"6443"}
+export INJECTOR_WEBHOOK_NETWORK_POLICY_PORT=${INJECTOR_WEBHOOK_NETWORK_POLICY_PORT:-"6443"}
 export SKIP_VAR_SET=""
 export OPERATOR_NAMESPACE=$NAMESPACE
 export OPERATOR_EXEC=kubectl
@@ -67,9 +89,15 @@ if [ $CLUSTER_TYPE == "openshift" ]; then
   export SRIOV_NETWORK_OPERATOR_IMAGE="image-registry.openshift-image-registry.svc:5000/$NAMESPACE/sriov-network-operator:latest"
   export SRIOV_NETWORK_CONFIG_DAEMON_IMAGE="image-registry.openshift-image-registry.svc:5000/$NAMESPACE/sriov-network-config-daemon:latest"
   export SRIOV_NETWORK_WEBHOOK_IMAGE="image-registry.openshift-image-registry.svc:5000/$NAMESPACE/sriov-network-operator-webhook:latest"
-fi
 
-echo "## deploying SRIOV Network Operator"
-hack/deploy-setup.sh $NAMESPACE
+  echo "## apply CRDs"
+  kubectl apply -f $root/config/crd/bases
+
+  echo "## deploying SRIOV Network Operator"
+  hack/deploy-setup.sh $NAMESPACE
+else
+  export HELM_MODE=upgrade
+  hack/deploy-operator-helm.sh
+fi
 
 kubectl -n ${NAMESPACE} delete po --all

@@ -75,7 +75,6 @@ func (n *network) TryToGetVirtualInterfaceName(pciAddr string) string {
 func (n *network) TryGetInterfaceName(pciAddr string) string {
 	names, err := n.dputilsLib.GetNetNames(pciAddr)
 	if err != nil || len(names) < 1 {
-		log.Log.Error(err, "TryGetInterfaceName(): failed to get interface name")
 		return ""
 	}
 	netDevName := names[0]
@@ -96,7 +95,6 @@ func (n *network) TryGetInterfaceName(pciAddr string) string {
 		return name
 	}
 
-	log.Log.V(2).Info("TryGetInterfaceName()", "name", netDevName)
 	return netDevName
 }
 
@@ -243,11 +241,11 @@ func (n *network) GetNetDevNodeGUID(pciAddr string) string {
 }
 
 func (n *network) GetNetDevLinkSpeed(ifaceName string) string {
-	log.Log.V(2).Info("GetNetDevLinkSpeed(): get LinkSpeed", "device", ifaceName)
+	funcLog := log.Log.WithValues("device", ifaceName)
 	speedFilePath := filepath.Join(vars.FilesystemRoot, consts.SysClassNet, ifaceName, "speed")
 	data, err := os.ReadFile(speedFilePath)
 	if err != nil {
-		log.Log.Error(err, "GetNetDevLinkSpeed(): fail to read Link Speed file", "path", speedFilePath)
+		funcLog.Info("GetNetDevLinkSpeed(): WARNING: fail to read Link Speed file", "path", speedFilePath, "error", err)
 		return ""
 	}
 
@@ -264,12 +262,12 @@ func (n *network) GetDevlinkDeviceParam(pciAddr, paramName string) (string, erro
 		funcLog.Error(err, "GetDevlinkDeviceParam(): fail to get devlink device param")
 		return "", err
 	}
-	if len(param.Values) == 0 {
-		err = fmt.Errorf("param %s has no value", paramName)
-		funcLog.Error(err, "GetDevlinkDeviceParam(): error")
-		return "", err
+	if len(param.Values) == 0 || param.Values[0].Data == nil {
+		funcLog.Info("GetDevlinkDeviceParam(): WARNING: can't read devlink parameter from the device, an empty value received")
+		return "", nil
 	}
 	var value string
+	var ok bool
 	switch param.Type {
 	case nl.DEVLINK_PARAM_TYPE_U8, nl.DEVLINK_PARAM_TYPE_U16, nl.DEVLINK_PARAM_TYPE_U32:
 		var valData uint64
@@ -281,14 +279,22 @@ func (n *network) GetDevlinkDeviceParam(pciAddr, paramName string) (string, erro
 		case uint32:
 			valData = uint64(v)
 		default:
-			return "", fmt.Errorf("unexpected uint type type")
+			return "", fmt.Errorf("value is not uint")
 		}
 		value = strconv.FormatUint(valData, 10)
 
 	case nl.DEVLINK_PARAM_TYPE_STRING:
-		value = param.Values[0].Data.(string)
+		value, ok = param.Values[0].Data.(string)
+		if !ok {
+			return "", fmt.Errorf("value is not a string")
+		}
 	case nl.DEVLINK_PARAM_TYPE_BOOL:
-		value = strconv.FormatBool(param.Values[0].Data.(bool))
+		var boolValue bool
+		boolValue, ok = param.Values[0].Data.(bool)
+		if !ok {
+			return "", fmt.Errorf("value is not a bool")
+		}
+		value = strconv.FormatBool(boolValue)
 	default:
 		return "", fmt.Errorf("unknown value type: %d", param.Type)
 	}
@@ -403,4 +409,60 @@ func (n *network) GetNetDevLinkAdminState(ifaceName string) string {
 	}
 
 	return consts.LinkAdminStateDown
+}
+
+// GetPciAddressFromInterfaceName parses sysfs to get pci address of an interface by name
+func (n *network) GetPciAddressFromInterfaceName(interfaceName string) (string, error) {
+	log.Log.V(2).Info("GetPciAddressFromInterfaceName(): get pci address", "interface", interfaceName)
+	sysfsPath := filepath.Join(vars.FilesystemRoot, consts.SysClassNet, interfaceName, "device")
+
+	pciDevDir, err := os.Readlink(sysfsPath)
+
+	if err != nil {
+		log.Log.Error(err, "GetPciAddressFromInterfaceName(): failed to get pci device dir", "interface", interfaceName)
+		return "", err
+	}
+
+	pciAddress := filepath.Base(pciDevDir)
+	log.Log.V(2).Info("GetPciAddressFromInterfaceName(): result", "interface", interfaceName, "pci address", pciAddress)
+	return pciAddress, nil
+}
+
+func (n *network) DiscoverRDMASubsystem() (string, error) {
+	subsystem, err := n.netlinkLib.RdmaSystemGetNetnsMode()
+
+	if err != nil {
+		log.Log.Error(err, "DiscoverRDMASubsystem(): failed to get RDMA subsystem mode")
+		return "", err
+	}
+
+	return subsystem, nil
+}
+
+func (n *network) SetRDMASubsystem(mode string) error {
+	log.Log.Info("SetRDMASubsystem(): Updating RDMA subsystem mode", "mode", mode)
+	path := filepath.Join(vars.FilesystemRoot, consts.Host, "etc", "modprobe.d", "sriov_network_operator_modules_config.conf")
+
+	if mode == "" {
+		err := os.Remove(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Log.Error(err, "failed to remove ib_core config file")
+			return err
+		}
+		return nil
+	}
+
+	modeValue := 1
+	if mode == "exclusive" {
+		modeValue = 0
+	}
+	config := fmt.Sprintf("# This file is managed by sriov-network-operator do not edit.\noptions ib_core netns_mode=%d\n", modeValue)
+
+	err := os.WriteFile(path, []byte(config), 0o644)
+	if err != nil {
+		log.Log.Error(err, "SetRDMASubsystem(): failed to write sriov_network_operator_modules_config.conf")
+		return fmt.Errorf("failed to write sriov_network_operator_modules_config.conf: %v", err)
+	}
+
+	return nil
 }

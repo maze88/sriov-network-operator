@@ -7,15 +7,20 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
@@ -24,11 +29,12 @@ import (
 )
 
 const (
-	LASTNETWORKNAMESPACE    = "operator.sriovnetwork.openshift.io/last-network-namespace"
-	NETATTDEFFINALIZERNAME  = "netattdef.finalizers.sriovnetwork.openshift.io"
-	POOLCONFIGFINALIZERNAME = "poolconfig.finalizers.sriovnetwork.openshift.io"
-	ESwithModeLegacy        = "legacy"
-	ESwithModeSwitchDev     = "switchdev"
+	LASTNETWORKNAMESPACE        = "operator.sriovnetwork.openshift.io/last-network-namespace"
+	NETATTDEFFINALIZERNAME      = "netattdef.finalizers.sriovnetwork.openshift.io"
+	POOLCONFIGFINALIZERNAME     = "poolconfig.finalizers.sriovnetwork.openshift.io"
+	OPERATORCONFIGFINALIZERNAME = "operatorconfig.finalizers.sriovnetwork.openshift.io"
+	ESwithModeLegacy            = "legacy"
+	ESwithModeSwitchDev         = "switchdev"
 
 	SriovCniStateEnable  = "enable"
 	SriovCniStateDisable = "disable"
@@ -50,13 +56,7 @@ var NicIDMap = []string{}
 
 var InitialState SriovNetworkNodeState
 
-// NetFilterType Represents the NetFilter tags to be used
-type NetFilterType int
-
 const (
-	// OpenstackNetworkID network UUID
-	OpenstackNetworkID NetFilterType = iota
-
 	SupportedNicIDConfigmap = "supported-nic-ids"
 )
 
@@ -66,15 +66,6 @@ const (
 	DaemonConfigurationMode  ConfigurationModeType = "daemon"
 	SystemdConfigurationMode ConfigurationModeType = "systemd"
 )
-
-func (e NetFilterType) String() string {
-	switch e {
-	case OpenstackNetworkID:
-		return "openstack/NetworkID"
-	default:
-		return fmt.Sprintf("%d", int(e))
-	}
-}
 
 func InitNicIDMapFromConfigMap(client kubernetes.Interface, namespace string) error {
 	cm, err := client.CoreV1().ConfigMaps(namespace).Get(
@@ -139,53 +130,6 @@ func IsVfSupportedModel(vendorID, deviceID string) bool {
 	return false
 }
 
-func IsEnabledUnsupportedVendor(vendorID string, unsupportedNicIDMap map[string]string) bool {
-	for _, n := range unsupportedNicIDMap {
-		if IsValidPciString(n) {
-			ids := strings.Split(n, " ")
-			if vendorID == ids[0] {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func IsValidPciString(nicIDString string) bool {
-	ids := strings.Split(nicIDString, " ")
-
-	if len(ids) != 3 {
-		log.Info("IsValidPciString(): ", nicIDString)
-		return false
-	}
-
-	if len(ids[0]) != 4 {
-		log.Info("IsValidPciString():", "Invalid vendor PciId ", ids[0])
-		return false
-	}
-	if _, err := strconv.ParseInt(ids[0], 16, 32); err != nil {
-		log.Info("IsValidPciString():", "Invalid vendor PciId ", ids[0])
-	}
-
-	if len(ids[1]) != 4 {
-		log.Info("IsValidPciString():", "Invalid PciId of PF ", ids[1])
-		return false
-	}
-	if _, err := strconv.ParseInt(ids[1], 16, 32); err != nil {
-		log.Info("IsValidPciString():", "Invalid PciId of PF ", ids[1])
-	}
-
-	if len(ids[2]) != 4 {
-		log.Info("IsValidPciString():", "Invalid PciId of VF ", ids[2])
-		return false
-	}
-	if _, err := strconv.ParseInt(ids[2], 16, 32); err != nil {
-		log.Info("IsValidPciString():", "Invalid PciId of VF ", ids[2])
-	}
-
-	return true
-}
-
 func GetSupportedVfIds() []string {
 	var vfIds []string
 	for _, n := range NicIDMap {
@@ -229,15 +173,6 @@ func ContainsSwitchdevInterface(interfaces []Interface) bool {
 	return false
 }
 
-func FindInterface(interfaces Interfaces, name string) (iface Interface, err error) {
-	for _, i := range interfaces {
-		if i.Name == name {
-			return i, nil
-		}
-	}
-	return Interface{}, fmt.Errorf("unable to find interface: %v", name)
-}
-
 // GetEswitchModeFromSpec returns ESwitchMode from the interface spec, returns legacy if not set
 func GetEswitchModeFromSpec(ifaceSpec *Interface) string {
 	if ifaceSpec.EswitchMode == "" {
@@ -258,23 +193,23 @@ func NeedToUpdateSriov(ifaceSpec *Interface, ifaceStatus *InterfaceExt) bool {
 	if ifaceSpec.Mtu > 0 {
 		mtu := ifaceSpec.Mtu
 		if mtu > ifaceStatus.Mtu {
-			log.V(2).Info("NeedToUpdateSriov(): MTU needs update", "desired", mtu, "current", ifaceStatus.Mtu)
+			log.V(0).Info("NeedToUpdateSriov(): MTU needs update", "desired", mtu, "current", ifaceStatus.Mtu)
 			return true
 		}
 	}
 	currentEswitchMode := GetEswitchModeFromStatus(ifaceStatus)
 	desiredEswitchMode := GetEswitchModeFromSpec(ifaceSpec)
 	if currentEswitchMode != desiredEswitchMode {
-		log.V(2).Info("NeedToUpdateSriov(): EswitchMode needs update", "desired", desiredEswitchMode, "current", currentEswitchMode)
+		log.V(0).Info("NeedToUpdateSriov(): EswitchMode needs update", "desired", desiredEswitchMode, "current", currentEswitchMode)
 		return true
 	}
 	if ifaceSpec.NumVfs != ifaceStatus.NumVfs {
-		log.V(2).Info("NeedToUpdateSriov(): NumVfs needs update", "desired", ifaceSpec.NumVfs, "current", ifaceStatus.NumVfs)
+		log.V(0).Info("NeedToUpdateSriov(): NumVfs needs update", "desired", ifaceSpec.NumVfs, "current", ifaceStatus.NumVfs)
 		return true
 	}
 
 	if ifaceStatus.LinkAdminState == consts.LinkAdminStateDown {
-		log.V(2).Info("NeedToUpdateSriov(): PF link status needs update", "desired to include", "up", "current", ifaceStatus.LinkAdminState)
+		log.V(0).Info("NeedToUpdateSriov(): PF link status needs update", "desired to include", "up", "current", ifaceStatus.LinkAdminState)
 		return true
 	}
 
@@ -283,24 +218,24 @@ func NeedToUpdateSriov(ifaceSpec *Interface, ifaceStatus *InterfaceExt) bool {
 			for _, groupSpec := range ifaceSpec.VfGroups {
 				if IndexInRange(vfStatus.VfID, groupSpec.VfRange) {
 					if vfStatus.Driver == "" {
-						log.V(2).Info("NeedToUpdateSriov(): Driver needs update - has no driver",
+						log.V(0).Info("NeedToUpdateSriov(): Driver needs update - has no driver",
 							"desired", groupSpec.DeviceType)
 						return true
 					}
 					if groupSpec.DeviceType != "" && groupSpec.DeviceType != consts.DeviceTypeNetDevice {
 						if groupSpec.DeviceType != vfStatus.Driver {
-							log.V(2).Info("NeedToUpdateSriov(): Driver needs update",
+							log.V(0).Info("NeedToUpdateSriov(): Driver needs update",
 								"desired", groupSpec.DeviceType, "current", vfStatus.Driver)
 							return true
 						}
 					} else {
 						if StringInArray(vfStatus.Driver, vars.DpdkDrivers) {
-							log.V(2).Info("NeedToUpdateSriov(): Driver needs update",
+							log.V(0).Info("NeedToUpdateSriov(): Driver needs update",
 								"desired", groupSpec.DeviceType, "current", vfStatus.Driver)
 							return true
 						}
 						if vfStatus.Mtu != 0 && groupSpec.Mtu != 0 && vfStatus.Mtu != groupSpec.Mtu {
-							log.V(2).Info("NeedToUpdateSriov(): VF MTU needs update",
+							log.V(0).Info("NeedToUpdateSriov(): VF MTU needs update",
 								"vf", vfStatus.VfID, "desired", groupSpec.Mtu, "current", vfStatus.Mtu)
 							return true
 						}
@@ -310,20 +245,20 @@ func NeedToUpdateSriov(ifaceSpec *Interface, ifaceStatus *InterfaceExt) bool {
 							// Node GUID. We intentionally skip empty Node GUID in vfStatus because this may happen
 							// when the VF is allocated to a workload.
 							if vfStatus.GUID == consts.UninitializedNodeGUID {
-								log.V(2).Info("NeedToUpdateSriov(): VF GUID needs update",
+								log.V(0).Info("NeedToUpdateSriov(): VF GUID needs update",
 									"vf", vfStatus.VfID, "current", vfStatus.GUID)
 								return true
 							}
 						}
 						// this is needed to be sure the admin mac address is configured as expected
 						if ifaceSpec.ExternallyManaged {
-							log.V(2).Info("NeedToUpdateSriov(): need to update the device as it's externally manage",
+							log.V(0).Info("NeedToUpdateSriov(): need to update the device as it's externally manage",
 								"device", ifaceStatus.PciAddress)
 							return true
 						}
 					}
 					if groupSpec.VdpaType != vfStatus.VdpaType {
-						log.V(2).Info("NeedToUpdateSriov(): VF VdpaType mismatch",
+						log.V(0).Info("NeedToUpdateSriov(): VF VdpaType mismatch",
 							"desired", groupSpec.VdpaType, "current", vfStatus.VdpaType)
 						return true
 					}
@@ -372,6 +307,20 @@ func StringInArray(val string, array []string) bool {
 	return false
 }
 
+// NameOrAltNameMatchesPfNames checks if the given name or any of the alternative names
+// match any entry in the pfNames list.
+func NameOrAltNameMatchesPfNames(name string, altNames []string, pfNames []string) bool {
+	if StringInArray(name, pfNames) {
+		return true
+	}
+	for _, altName := range altNames {
+		if StringInArray(altName, pfNames) {
+			return true
+		}
+	}
+	return false
+}
+
 func RemoveString(s string, slice []string) (result []string, found bool) {
 	if len(slice) != 0 {
 		for _, item := range slice {
@@ -397,8 +346,7 @@ func UniqueAppend(inSlice []string, strings ...string) []string {
 // Apply policy to SriovNetworkNodeState CR
 func (p *SriovNetworkNodePolicy) Apply(state *SriovNetworkNodeState, equalPriority bool) error {
 	s := p.Spec.NicSelector
-	if s.Vendor == "" && s.DeviceID == "" && len(s.RootDevices) == 0 && len(s.PfNames) == 0 &&
-		len(s.NetFilter) == 0 {
+	if s.IsEmpty() {
 		// Empty NicSelector match none
 		return nil
 	}
@@ -432,6 +380,70 @@ func (p *SriovNetworkNodePolicy) Apply(state *SriovNetworkNodeState, equalPriori
 				if !found {
 					state.Spec.Interfaces = append(state.Spec.Interfaces, result)
 				}
+			}
+		}
+	}
+	return nil
+}
+
+// ApplyBridgeConfig applies bridge configuration from the policy to the provided state
+func (p *SriovNetworkNodePolicy) ApplyBridgeConfig(state *SriovNetworkNodeState) error {
+	if p.Spec.NicSelector.IsEmpty() {
+		// Empty NicSelector match none
+		return nil
+	}
+	// sanity check the policy
+	if !p.Spec.Bridge.IsEmpty() {
+		if p.Spec.EswitchMode != ESwithModeSwitchDev {
+			return fmt.Errorf("eSwitchMode must be switchdev to use software bridge management")
+		}
+		if p.Spec.LinkType != "" && !strings.EqualFold(p.Spec.LinkType, consts.LinkTypeETH) {
+			return fmt.Errorf("linkType must be eth or ETH to use software bridge management")
+		}
+		if p.Spec.ExternallyManaged {
+			return fmt.Errorf("software bridge management can't be used when link is externally managed")
+		}
+	}
+	for _, iface := range state.Status.Interfaces {
+		if p.Spec.NicSelector.Selected(&iface) {
+			if p.Spec.Bridge.OVS == nil {
+				// The policy has no OVS bridge config, this means that the node's state should have no managed OVS bridges for the interfaces that match the policy.
+				// Currently PF to OVS bridge mapping is always 1 to 1 (bonding is not supported at the moment), meaning we can remove the OVS bridge
+				// config from the node's state if it has the interface (that matches "empty-bridge" policy) in the uplink section.
+				state.Spec.Bridges.OVS = slices.DeleteFunc(state.Spec.Bridges.OVS, func(br OVSConfigExt) bool {
+					return slices.ContainsFunc(br.Uplinks, func(uplink OVSUplinkConfigExt) bool {
+						return uplink.PciAddress == iface.PciAddress
+					})
+				})
+				if len(state.Spec.Bridges.OVS) == 0 {
+					state.Spec.Bridges.OVS = nil
+				}
+				continue
+			}
+			ovsBridge := OVSConfigExt{
+				Name:   GenerateBridgeName(&iface),
+				Bridge: p.Spec.Bridge.OVS.Bridge,
+				Uplinks: []OVSUplinkConfigExt{{
+					PciAddress: iface.PciAddress,
+					Name:       iface.Name,
+					Interface:  p.Spec.Bridge.OVS.Uplink.Interface,
+				}},
+			}
+			if p.Spec.Mtu > 0 {
+				mtu := p.Spec.Mtu
+				ovsBridge.Uplinks[0].Interface.MTURequest = &mtu
+			}
+			log.Info("Update bridge for interface", "name", iface.Name, "bridge", ovsBridge.Name)
+
+			// We need to keep slices with bridges ordered to avoid unnecessary updates in the K8S API.
+			// Use binary search to insert (or update) the bridge config to the right place in the slice to keep it sorted.
+			pos, exist := slices.BinarySearchFunc(state.Spec.Bridges.OVS, ovsBridge, func(x, y OVSConfigExt) int {
+				return strings.Compare(x.Name, y.Name)
+			})
+			if exist {
+				state.Spec.Bridges.OVS[pos] = ovsBridge
+			} else {
+				state.Spec.Bridges.OVS = slices.Insert(state.Spec.Bridges.OVS, pos, ovsBridge)
 			}
 		}
 	}
@@ -568,6 +580,15 @@ func ParseVfRange(device string) (rootDeviceName string, rngSt, rngEnd int, err 
 	return
 }
 
+// IsEmpty returns true if nicSelector is empty
+func (selector *SriovNetworkNicSelector) IsEmpty() bool {
+	return selector.Vendor == "" &&
+		selector.DeviceID == "" &&
+		len(selector.RootDevices) == 0 &&
+		len(selector.PfNames) == 0 &&
+		len(selector.NetFilter) == 0
+}
+
 func (selector *SriovNetworkNicSelector) Selected(iface *InterfaceExt) bool {
 	if selector.Vendor != "" && selector.Vendor != iface.Vendor {
 		return false
@@ -588,7 +609,8 @@ func (selector *SriovNetworkNicSelector) Selected(iface *InterfaceExt) bool {
 				pfNames = append(pfNames, p)
 			}
 		}
-		if !StringInArray(iface.Name, pfNames) {
+
+		if !NameOrAltNameMatchesPfNames(iface.Name, iface.AltNames, pfNames) {
 			return false
 		}
 	}
@@ -631,6 +653,7 @@ func (cr *SriovIBNetwork) RenderNetAttDef() (*uns.Unstructured, error) {
 	} else {
 		data.Data["SriovNetworkNamespace"] = cr.Spec.NetworkNamespace
 	}
+	data.Data["Owner"] = OwnerRefToString(cr)
 	data.Data["SriovCniResourceName"] = os.Getenv("RESOURCE_PREFIX") + "/" + cr.Spec.ResourceName
 
 	data.Data["StateConfigured"] = true
@@ -685,6 +708,11 @@ func (cr *SriovIBNetwork) NetworkNamespace() string {
 	return cr.Spec.NetworkNamespace
 }
 
+// GetConditions returns the conditions from the status
+func (cr *SriovIBNetwork) GetConditions() []metav1.Condition {
+	return cr.Status.Conditions
+}
+
 // RenderNetAttDef renders a net-att-def for sriov CNI
 func (cr *SriovNetwork) RenderNetAttDef() (*uns.Unstructured, error) {
 	logger := log.WithName("RenderNetAttDef")
@@ -699,6 +727,7 @@ func (cr *SriovNetwork) RenderNetAttDef() (*uns.Unstructured, error) {
 	} else {
 		data.Data["SriovNetworkNamespace"] = cr.Spec.NetworkNamespace
 	}
+	data.Data["Owner"] = OwnerRefToString(cr)
 	data.Data["SriovCniResourceName"] = os.Getenv("RESOURCE_PREFIX") + "/" + cr.Spec.ResourceName
 	data.Data["SriovCniVlan"] = cr.Spec.Vlan
 
@@ -803,6 +832,11 @@ func (cr *SriovNetwork) NetworkNamespace() string {
 	return cr.Spec.NetworkNamespace
 }
 
+// GetConditions returns the conditions from the status
+func (cr *SriovNetwork) GetConditions() []metav1.Condition {
+	return cr.Status.Conditions
+}
+
 // RenderNetAttDef renders a net-att-def for sriov CNI
 func (cr *OVSNetwork) RenderNetAttDef() (*uns.Unstructured, error) {
 	logger := log.WithName("RenderNetAttDef")
@@ -817,6 +851,7 @@ func (cr *OVSNetwork) RenderNetAttDef() (*uns.Unstructured, error) {
 	} else {
 		data.Data["NetworkNamespace"] = cr.Spec.NetworkNamespace
 	}
+	data.Data["Owner"] = OwnerRefToString(cr)
 	data.Data["CniResourceName"] = os.Getenv("RESOURCE_PREFIX") + "/" + cr.Spec.ResourceName
 
 	if cr.Spec.Capabilities == "" {
@@ -863,6 +898,21 @@ func (cr *OVSNetwork) RenderNetAttDef() (*uns.Unstructured, error) {
 // NetworkNamespace returns target network namespace for the network
 func (cr *OVSNetwork) NetworkNamespace() string {
 	return cr.Spec.NetworkNamespace
+}
+
+// GetConditions returns the conditions from the status
+func (cr *OVSNetwork) GetConditions() []metav1.Condition {
+	return cr.Status.Conditions
+}
+
+// GetConditions returns the conditions from the status.
+func (cr *SriovOperatorConfig) GetConditions() []metav1.Condition {
+	return cr.Status.Conditions
+}
+
+// GetConditions returns the conditions from the status.
+func (s *SriovNetworkNodeState) GetConditions() []metav1.Condition {
+	return s.Status.Conditions
 }
 
 // NetFilterMatch -- parse netFilter and check for a match
@@ -922,4 +972,222 @@ func (s *SriovNetworkPoolConfig) MaxUnavailable(numOfNodes int) (int, error) {
 	}
 
 	return maxunavail, nil
+}
+
+// GenerateBridgeName generate predictable name for the software bridge
+// current format is: br-0000_00_03.0
+func GenerateBridgeName(iface *InterfaceExt) string {
+	return fmt.Sprintf("br-%s", strings.ReplaceAll(iface.PciAddress, ":", "_"))
+}
+
+// NeedToUpdateBridges returns true if bridge for the host requires update
+func NeedToUpdateBridges(bridgeSpec, bridgeStatus *Bridges) bool {
+	return !equality.Semantic.DeepEqual(bridgeSpec, bridgeStatus)
+}
+
+// SetKeepUntilTime sets an annotation to hold the "keep until time" for the node’s state.
+// The "keep until time" specifies the earliest time at which the state object can be removed
+// if the daemon's pod is not found on the node.
+func (s *SriovNetworkNodeState) SetKeepUntilTime(t time.Time) {
+	ts := t.Format(time.RFC3339)
+	annotations := s.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[consts.NodeStateKeepUntilAnnotation] = ts
+	s.SetAnnotations(annotations)
+}
+
+// GetKeepUntilTime returns the value that is stored in the "keep until time" annotation.
+// The "keep until time" specifies the earliest time at which the state object can be removed
+// if the daemon's pod is not found on the node.
+// Return zero time instant if annotaion is not found on the object or if it has a wrong format.
+func (s *SriovNetworkNodeState) GetKeepUntilTime() time.Time {
+	t, err := time.Parse(time.RFC3339, s.GetAnnotations()[consts.NodeStateKeepUntilAnnotation])
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// ResetKeepUntilTime removes "keep until time" annotation from the state object.
+// The "keep until time" specifies the earliest time at which the state object can be removed
+// if the daemon's pod is not found on the node.
+// Returns true if the value was removed, false otherwise.
+func (s *SriovNetworkNodeState) ResetKeepUntilTime() bool {
+	annotations := s.GetAnnotations()
+	_, exist := annotations[consts.NodeStateKeepUntilAnnotation]
+	if !exist {
+		return false
+	}
+	delete(annotations, consts.NodeStateKeepUntilAnnotation)
+	s.SetAnnotations(annotations)
+	return true
+}
+
+func OwnerRefToString(cr client.Object) string {
+	if cr == nil {
+		return "owner-object-not-found"
+	}
+	if cr.GetObjectKind().GroupVersionKind().Empty() {
+		return "unknown/" + cr.GetNamespace() + "/" + cr.GetName()
+	}
+
+	return cr.GetObjectKind().GroupVersionKind().GroupKind().String() + "/" + cr.GetNamespace() + "/" + cr.GetName()
+}
+
+// ResolveInterfaceName resolves an interface name that might be an alternative name
+// to the actual interface name using the nodeState. If the name is an alternative name,
+// it returns the actual interface name. Otherwise, it returns the name as-is.
+func ResolveInterfaceName(name string, nodeState *SriovNetworkNodeState) string {
+	if nodeState == nil {
+		return name
+	}
+	// Check all interfaces in the nodeState
+	for _, iface := range nodeState.Status.Interfaces {
+		// Check if the name matches the actual interface name
+		if iface.Name == name {
+			return name
+		}
+		if StringInArray(name, iface.AltNames) {
+			return iface.Name
+		}
+	}
+	// If not found in nodeState, return the name as-is
+	return name
+}
+
+// SetNodeStateConfigurationConditions sets configuration-related conditions based on the SyncStatus value.
+func (s *SriovNetworkNodeState) SetNodeStateConfigurationConditions(syncStatus, failedMessage string, waitingForDrain bool) {
+	generation := s.Generation
+
+	switch syncStatus {
+	case consts.SyncStatusInProgress:
+		message := "Node configuration is in progress"
+		reason := ReasonApplyingConfiguration
+		readyReason := ReasonNotReady
+		if waitingForDrain {
+			message = "Waiting for node drain before applying configuration"
+			reason = ReasonWaitingForDrain
+			readyReason = ReasonWaitingForDrain
+		}
+		if failedMessage != "" {
+			if waitingForDrain {
+				message = "Waiting for node drain before retrying configuration: " + failedMessage
+			} else {
+				message = "Retrying after previous failure: " + failedMessage
+			}
+		}
+
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:               ConditionProgressing,
+			Status:             metav1.ConditionTrue,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: generation,
+		})
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:               ConditionReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             readyReason,
+			Message:            message,
+			ObservedGeneration: generation,
+		})
+
+	case consts.SyncStatusSucceeded:
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:               ConditionProgressing,
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonNotProgressing,
+			Message:            "Node configuration completed successfully",
+			ObservedGeneration: generation,
+		})
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:               ConditionReady,
+			Status:             metav1.ConditionTrue,
+			Reason:             ReasonNodeReady,
+			Message:            "Node configuration is ready",
+			ObservedGeneration: generation,
+		})
+
+	case consts.SyncStatusFailed:
+		message := "Node configuration failed"
+		if failedMessage != "" {
+			message = fmt.Sprintf("Node configuration failed: %s", failedMessage)
+		}
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:               ConditionProgressing,
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonNotProgressing,
+			Message:            "Configuration attempt completed with failure",
+			ObservedGeneration: generation,
+		})
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:               ConditionReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonNotReady,
+			Message:            message,
+			ObservedGeneration: generation,
+		})
+	}
+}
+
+// SetNodeStateDrainConditions sets the Draining condition based on the drain state.
+func (s *SriovNetworkNodeState) SetNodeStateDrainConditions(state DrainState, errorMessage string) {
+	generation := s.Generation
+
+	switch state {
+	case DrainStateIdle:
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:               ConditionDraining,
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonDrainNotNeeded,
+			Message:            "No drain operation in progress",
+			ObservedGeneration: generation,
+		})
+
+	case DrainStatePending:
+		message := "Waiting for an available drain slot"
+		if errorMessage != "" {
+			message = errorMessage
+		}
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:               ConditionDraining,
+			Status:             metav1.ConditionTrue,
+			Reason:             ReasonDrainPending,
+			Message:            message,
+			ObservedGeneration: generation,
+		})
+
+	case DrainStateDraining:
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:               ConditionDraining,
+			Status:             metav1.ConditionTrue,
+			Reason:             ReasonDrainingNode,
+			Message:            "Node drain is in progress",
+			ObservedGeneration: generation,
+		})
+
+	case DrainStateDrainingWithErrors:
+		message := "Node drain encountered errors"
+		if errorMessage != "" {
+			message = fmt.Sprintf("Node drain encountered errors: %s", errorMessage)
+		}
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:               ConditionDraining,
+			Status:             metav1.ConditionTrue,
+			Reason:             ReasonDrainFailed,
+			Message:            message,
+			ObservedGeneration: generation,
+		})
+
+	case DrainStateComplete:
+		meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
+			Type:               ConditionDraining,
+			Status:             metav1.ConditionFalse,
+			Reason:             ReasonDrainCompleted,
+			Message:            "Drain operation completed successfully",
+			ObservedGeneration: generation,
+		})
+	}
 }

@@ -18,6 +18,7 @@ package v1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -35,7 +36,7 @@ type SriovNetworkSpec struct {
 	//IPAM configuration to be used for this network.
 	IPAM string `json:"ipam,omitempty"`
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=4096
+	// +kubebuilder:validation:Maximum=4094
 	// VLAN ID to assign for the VF. Defaults to 0.
 	Vlan int `json:"vlan,omitempty"`
 	// +kubebuilder:validation:Minimum=0
@@ -75,12 +76,13 @@ type SriovNetworkSpec struct {
 
 // SriovNetworkStatus defines the observed state of SriovNetwork
 type SriovNetworkStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	ConditionStatus `json:",inline"`
 }
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
+//+kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+//+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // SriovNetwork is the Schema for the sriovnetworks API
 type SriovNetwork struct {
@@ -101,5 +103,8 @@ type SriovNetworkList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&SriovNetwork{}, &SriovNetworkList{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(GroupVersion, &SriovNetwork{}, &SriovNetworkList{})
+		return nil
+	})
 }

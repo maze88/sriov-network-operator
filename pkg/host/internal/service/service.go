@@ -14,6 +14,7 @@ import (
 
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/host/types"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/render"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/utils"
 )
 
@@ -32,6 +33,7 @@ func New(utilsHelper utils.CmdInterface) types.ServiceInterface {
 type ServiceInjectionManifestFile struct {
 	Name    string
 	Dropins []struct {
+		Name     string
 		Contents string
 	}
 }
@@ -85,7 +87,7 @@ func (s *service) ReadService(servicePath string) (*types.Service, error) {
 // EnableService creates service file and enables it with systemctl enable
 func (s *service) EnableService(service *types.Service) error {
 	// Write service file
-	err := os.WriteFile(path.Join(consts.Chroot, service.Path), []byte(service.Content), 0644)
+	err := os.WriteFile(path.Join(consts.Chroot, service.Path), []byte(service.Content), 0o644)
 	if err != nil {
 		return err
 	}
@@ -107,11 +109,11 @@ func (s *service) EnableService(service *types.Service) error {
 
 // CompareServices returns true if serviceA needs update(doesn't contain all fields from service B)
 func (s *service) CompareServices(serviceA, serviceB *types.Service) (bool, error) {
-	optsA, err := unit.Deserialize(strings.NewReader(serviceA.Content))
+	optsA, err := unit.DeserializeOptions(strings.NewReader(serviceA.Content))
 	if err != nil {
 		return false, err
 	}
-	optsB, err := unit.Deserialize(strings.NewReader(serviceB.Content))
+	optsB, err := unit.DeserializeOptions(strings.NewReader(serviceB.Content))
 	if err != nil {
 		return false, err
 	}
@@ -130,9 +132,12 @@ OUTER:
 	return false, nil
 }
 
-// ReadServiceInjectionManifestFile reads service injection file
-func (s *service) ReadServiceInjectionManifestFile(path string) (*types.Service, error) {
-	data, err := os.ReadFile(path)
+// ReadOvsServiceInjectionManifestFile reads service injection file.
+// The returned Service.Path points to the operator-owned drop-in file inside the
+// service's .d/ directory; WriteServiceDropin must be used to apply it so that
+// each update replaces the file rather than appending another ExecStartPre.
+func (s *service) ReadOvsServiceInjectionManifestFile(filePath string, ovsConfig map[string]string) (*types.Service, error) {
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, err
 	}
@@ -142,11 +147,38 @@ func (s *service) ReadServiceInjectionManifestFile(path string) (*types.Service,
 		return nil, err
 	}
 
+	externalIds, otherOvsConfig, err := utils.RenderOtherOvsConfigOption(ovsConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	d := render.MakeRenderData()
+	d.Data["ExternalIds"] = externalIds
+	d.Data["OtherOvsConfig"] = otherOvsConfig
+
+	srv, err := render.RenderTemplate(serviceContent.Dropins[0].Contents, &d)
+	if err != nil {
+		return nil, err
+	}
+
+	dropinPath := systemdDir + serviceContent.Name + ".d/" + serviceContent.Dropins[0].Name
 	return &types.Service{
 		Name:    serviceContent.Name,
-		Path:    systemdDir + serviceContent.Name,
-		Content: serviceContent.Dropins[0].Contents,
+		Path:    dropinPath,
+		Content: srv.String(),
 	}, nil
+}
+
+// WriteServiceDropin creates (or replaces) the drop-in file for service.
+// The directory is created if it does not exist. This is the counterpart to
+// ReadOvsServiceInjectionManifestFile and must be used instead of
+// UpdateSystemService for OVS drop-in updates.
+func (s *service) WriteServiceDropin(service *types.Service) error {
+	dropinDir := path.Join(consts.Chroot, path.Dir(service.Path))
+	if err := os.MkdirAll(dropinDir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path.Join(consts.Chroot, service.Path), []byte(service.Content), 0o644)
 }
 
 // ReadServiceManifestFile reads service file
@@ -177,7 +209,7 @@ func (s *service) UpdateSystemService(serviceObj *types.Service) error {
 		// Invalid case to reach here
 		return fmt.Errorf("can't update non-existing service %q", serviceObj.Name)
 	}
-	serviceOptions, err := unit.Deserialize(strings.NewReader(serviceObj.Content))
+	serviceOptions, err := unit.DeserializeOptions(strings.NewReader(serviceObj.Content))
 	if err != nil {
 		return err
 	}
@@ -191,7 +223,7 @@ func (s *service) UpdateSystemService(serviceObj *types.Service) error {
 
 // appendToService appends given fields to service
 func appendToService(service *types.Service, options ...*unit.UnitOption) (*types.Service, error) {
-	serviceOptions, err := unit.Deserialize(strings.NewReader(service.Content))
+	serviceOptions, err := unit.DeserializeOptions(strings.NewReader(service.Content))
 	if err != nil {
 		return nil, err
 	}

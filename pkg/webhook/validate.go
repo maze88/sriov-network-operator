@@ -13,10 +13,12 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/utils"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
 )
 
@@ -62,8 +64,8 @@ func validateSriovOperatorConfigDisableDrain(cr *sriovnetworkv1.SriovOperatorCon
 	if !cr.Spec.DisableDrain {
 		return nil
 	}
-
-	previousConfig, err := snclient.SriovnetworkV1().SriovOperatorConfigs(cr.Namespace).Get(context.Background(), cr.Name, metav1.GetOptions{})
+	previousConfig := &sriovnetworkv1.SriovOperatorConfig{}
+	err := client.Get(context.Background(), runtimeclient.ObjectKey{Name: cr.Name, Namespace: namespace}, previousConfig)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
@@ -77,7 +79,8 @@ func validateSriovOperatorConfigDisableDrain(cr *sriovnetworkv1.SriovOperatorCon
 	}
 
 	// DisableDrain has been changed `false -> true`, check if any node is updating
-	nodeStates, err := snclient.SriovnetworkV1().SriovNetworkNodeStates(namespace).List(context.Background(), metav1.ListOptions{})
+	nodeStates := &sriovnetworkv1.SriovNetworkNodeStateList{}
+	err = client.List(context.Background(), nodeStates, &runtimeclient.ListOptions{Namespace: namespace})
 	if err != nil {
 		return fmt.Errorf("can't validate SriovOperatorConfig[%s] DisableDrain transition to true: %q", cr.Name, err)
 	}
@@ -96,10 +99,6 @@ func validateSriovNetworkPoolConfig(cr *sriovnetworkv1.SriovNetworkPoolConfig, o
 	log.Log.V(2).Info("validateSriovNetworkPoolConfig", "object", cr)
 	var warnings []string
 
-	if cr.GetName() == consts.DefaultConfigName && operation == v1.Delete {
-		return false, warnings, fmt.Errorf("default SriovOperatorConfig shouldn't be deleted")
-	}
-
 	if (cr.Spec.MaxUnavailable != nil || cr.Spec.NodeSelector != nil) && cr.Spec.OvsHardwareOffloadConfig.Name != "" {
 		return false, warnings, fmt.Errorf("SriovOperatorConfig can't have both parallel configuration and OvsHardwareOffloadConfig")
 	}
@@ -109,6 +108,10 @@ func validateSriovNetworkPoolConfig(cr *sriovnetworkv1.SriovNetworkPoolConfig, o
 		if err != nil {
 			return false, warnings, fmt.Errorf("SriovOperatorConfig invalid maxUnavailable: %v", err)
 		}
+	}
+
+	if err := utils.ValidateOvsConfig(cr.Spec.OvsHardwareOffloadConfig.OvsConfig); err != nil {
+		return false, warnings, fmt.Errorf("SriovNetworkPoolConfig invalid OvsHardwareOffloadConfig: %v", err)
 	}
 
 	return true, warnings, nil
@@ -145,14 +148,58 @@ func validateSriovNetworkNodePolicy(cr *sriovnetworkv1.SriovNetworkNodePolicy, o
 	return admit, warnings, nil
 }
 
+// resourceNameMaxLen is the maximum length of a resource name, matching the
+// Kubernetes DNS label limit (https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names).
+const resourceNameMaxLen = 63
+
+// resourceNameRegexp allows alphanumeric characters in any position, plus
+// hyphens and underscores in non-boundary positions (no leading/trailing hyphens or underscores).
+// Underscores are included for backward-compatibility with existing resource names.
+var resourceNameRegexp = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9_-]*[a-zA-Z0-9])?$`)
+
+func validateResourceName(name string) error {
+	if name == "" {
+		return fmt.Errorf("resource name must not be empty")
+	}
+	if len(name) > resourceNameMaxLen {
+		return fmt.Errorf("resource name %q must be no more than %d characters", name, resourceNameMaxLen)
+	}
+	if !resourceNameRegexp.MatchString(name) {
+		return fmt.Errorf("resource name %q is invalid: must consist of alphanumeric characters or hyphens, "+
+			"and must start and end with an alphanumeric character "+
+			"(e.g. 'myresource', 'net-device-1'), see https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names", name)
+	}
+	return nil
+}
+
 func staticValidateSriovNetworkNodePolicy(cr *sriovnetworkv1.SriovNetworkNodePolicy) (bool, error) {
-	var validString = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
-	if !validString.MatchString(cr.Spec.ResourceName) {
-		return false, fmt.Errorf("resource name \"%s\" contains invalid characters, the accepted syntax of the regular expressions is: \"^[a-zA-Z0-9_]+$\"", cr.Spec.ResourceName)
+	if err := validateResourceName(cr.Spec.ResourceName); err != nil {
+		return false, err
 	}
 
 	if cr.Spec.NicSelector.Vendor == "" && cr.Spec.NicSelector.DeviceID == "" && len(cr.Spec.NicSelector.PfNames) == 0 && len(cr.Spec.NicSelector.RootDevices) == 0 && cr.Spec.NicSelector.NetFilter == "" {
 		return false, fmt.Errorf("at least one of these parameters (vendor, deviceID, pfNames, rootDevices or netFilter) has to be defined in nicSelector in CR %s", cr.GetName())
+	}
+
+	// NetFilter specific validations - must be checked early before other validations
+	if cr.Spec.NicSelector.NetFilter != "" {
+		// 1. do not allow to use any other nicSelector fields when NetFilter is specified
+		if cr.Spec.NicSelector.Vendor != "" || cr.Spec.NicSelector.DeviceID != "" ||
+			len(cr.Spec.NicSelector.PfNames) > 0 || len(cr.Spec.NicSelector.RootDevices) > 0 {
+			return false, fmt.Errorf("nicSelector fields vendor, deviceID, pfNames, and rootDevices are not allowed when netFilter is specified")
+		}
+		// 2. do not support changing the EswitchMode when NetFilter is specified
+		if cr.Spec.EswitchMode != "" {
+			return false, fmt.Errorf("eSwitchMode is not supported when netFilter is specified")
+		}
+		// 3. do not allow Bridge when NetFilter is specified
+		if !cr.Spec.Bridge.IsEmpty() {
+			return false, fmt.Errorf("bridge configuration is not supported when netFilter is specified")
+		}
+		// 4. LinkType only "eth", "ETH" allowed when NetFilter is specified
+		if cr.Spec.LinkType != "" && !strings.EqualFold(cr.Spec.LinkType, consts.LinkTypeETH) {
+			return false, fmt.Errorf("linkType %q is not allowed when netFilter is specified, only 'eth' or 'ETH' are supported", cr.Spec.LinkType)
+		}
 	}
 
 	devMode := false
@@ -213,6 +260,12 @@ func staticValidateSriovNetworkNodePolicy(cr *sriovnetworkv1.SriovNetworkNodePol
 	if cr.Spec.DeviceType == consts.DeviceTypeVfioPci && cr.Spec.IsRdma {
 		return false, fmt.Errorf("'deviceType: vfio-pci' conflicts with 'isRdma: true'; Set 'deviceType' to (string)'netdevice' Or Set 'isRdma' to (bool)'false'")
 	}
+
+	// switchdev mode can be used only with ethernet links
+	if cr.Spec.LinkType != "" && !strings.EqualFold(cr.Spec.LinkType, consts.LinkTypeETH) && cr.Spec.EswitchMode == sriovnetworkv1.ESwithModeSwitchDev {
+		return false, fmt.Errorf("'eSwitchMode: switchdev' can be used only with ethernet links")
+	}
+
 	// vdpa: deviceType must be set to 'netdevice'
 	if cr.Spec.DeviceType != consts.DeviceTypeNetDevice && (cr.Spec.VdpaType == consts.VdpaTypeVirtio || cr.Spec.VdpaType == consts.VdpaTypeVhost) {
 		return false, fmt.Errorf("'deviceType: %s' conflicts with '%s'; Set 'deviceType' to (string)'netdevice' Or Remove 'vdpaType'", cr.Spec.DeviceType, cr.Spec.VdpaType)
@@ -221,6 +274,15 @@ func staticValidateSriovNetworkNodePolicy(cr *sriovnetworkv1.SriovNetworkNodePol
 	if (cr.Spec.VdpaType == consts.VdpaTypeVirtio || cr.Spec.VdpaType == consts.VdpaTypeVhost) && cr.Spec.EswitchMode != sriovnetworkv1.ESwithModeSwitchDev {
 		return false, fmt.Errorf("vdpa requires the device to be configured in switchdev mode")
 	}
+	// software bridge management: device must be configured in switchdev mode
+	if !cr.Spec.Bridge.IsEmpty() && cr.Spec.EswitchMode != sriovnetworkv1.ESwithModeSwitchDev {
+		return false, fmt.Errorf("software bridge management requires the device to be configured in switchdev mode")
+	}
+	// software bridge management: device can't be externally managed
+	if !cr.Spec.Bridge.IsEmpty() && cr.Spec.ExternallyManaged {
+		return false, fmt.Errorf("software bridge management can't be used when the device externally managed")
+	}
+
 	return true, nil
 }
 
@@ -235,11 +297,13 @@ func dynamicValidateSriovNetworkNodePolicy(cr *sriovnetworkv1.SriovNetworkNodePo
 	if err != nil {
 		return false, err
 	}
-	nsList, err := snclient.SriovnetworkV1().SriovNetworkNodeStates(namespace).List(context.Background(), metav1.ListOptions{})
+	nsList := &sriovnetworkv1.SriovNetworkNodeStateList{}
+	err = client.List(context.Background(), nsList, &runtimeclient.ListOptions{Namespace: namespace})
 	if err != nil {
 		return false, err
 	}
-	npList, err := snclient.SriovnetworkV1().SriovNetworkNodePolicies(namespace).List(context.Background(), metav1.ListOptions{})
+	npList := &sriovnetworkv1.SriovNetworkNodePolicyList{}
+	err = client.List(context.Background(), npList, &runtimeclient.ListOptions{Namespace: namespace})
 	if err != nil {
 		return false, err
 	}
@@ -269,8 +333,10 @@ func dynamicValidateSriovNetworkNodePolicy(cr *sriovnetworkv1.SriovNetworkNodePo
 }
 
 func validatePolicyForNodeStateAndPolicy(nsList *sriovnetworkv1.SriovNetworkNodeStateList, npList *sriovnetworkv1.SriovNetworkNodePolicyList, node *corev1.Node, cr *sriovnetworkv1.SriovNetworkNodePolicy, nodeInterfaceErrorList map[string][]string) error {
+	var currentNodeState *sriovnetworkv1.SriovNetworkNodeState
 	for _, ns := range nsList.Items {
 		if ns.GetName() == node.GetName() {
+			currentNodeState = &ns
 			interfaceAndErrorList, err := validatePolicyForNodeState(cr, &ns, node)
 			if err != nil {
 				return err
@@ -281,11 +347,9 @@ func validatePolicyForNodeStateAndPolicy(nsList *sriovnetworkv1.SriovNetworkNode
 			break
 		}
 	}
-
-	// validate current policy against policies in API (may not be converted to SriovNetworkNodeState yet)
 	for _, np := range npList.Items {
 		if np.GetName() != cr.GetName() && np.Selected(node) {
-			if err := validatePolicyForNodePolicy(cr, &np); err != nil {
+			if err := validatePolicyForNodePolicy(cr, &np, currentNodeState); err != nil {
 				return err
 			}
 		}
@@ -323,7 +387,7 @@ func validatePolicyForNodeState(policy *sriovnetworkv1.SriovNetworkNodePolicy, s
 					return nil, fmt.Errorf("MTU(%d) in CR %s is higher than the MTU for the PF externally value(%d)", policy.Spec.Mtu, policy.GetName(), iface.Mtu)
 				}
 
-				if policy.Spec.LinkType != "" && strings.ToLower(policy.Spec.LinkType) != strings.ToLower(iface.LinkType) {
+				if policy.Spec.LinkType != "" && !strings.EqualFold(policy.Spec.LinkType, iface.LinkType) {
 					return nil, fmt.Errorf("LinkType(%s) in CR %s is not equal to the LinkType for the PF externally value(%s)", policy.Spec.LinkType, policy.GetName(), iface.LinkType)
 				}
 			}
@@ -343,7 +407,7 @@ func validatePolicyForNodeState(policy *sriovnetworkv1.SriovNetworkNodePolicy, s
 	return nil, nil
 }
 
-func validatePolicyForNodePolicy(current *sriovnetworkv1.SriovNetworkNodePolicy, previous *sriovnetworkv1.SriovNetworkNodePolicy) error {
+func validatePolicyForNodePolicy(current *sriovnetworkv1.SriovNetworkNodePolicy, previous *sriovnetworkv1.SriovNetworkNodePolicy, nodeState *sriovnetworkv1.SriovNetworkNodeState) error {
 	log.Log.V(2).Info("validateConflictPolicy(): validate policy against policy",
 		"source", current.GetName(), "target", previous.GetName())
 
@@ -351,7 +415,7 @@ func validatePolicyForNodePolicy(current *sriovnetworkv1.SriovNetworkNodePolicy,
 		return nil
 	}
 
-	err := validatePfNames(current, previous)
+	err := validatePfNames(current, previous, nodeState)
 	if err != nil {
 		return err
 	}
@@ -369,16 +433,24 @@ func validatePolicyForNodePolicy(current *sriovnetworkv1.SriovNetworkNodePolicy,
 	return nil
 }
 
-func validatePfNames(current *sriovnetworkv1.SriovNetworkNodePolicy, previous *sriovnetworkv1.SriovNetworkNodePolicy) error {
+func validatePfNames(current *sriovnetworkv1.SriovNetworkNodePolicy, previous *sriovnetworkv1.SriovNetworkNodePolicy, nodeState *sriovnetworkv1.SriovNetworkNodeState) error {
 	for _, curPf := range current.Spec.NicSelector.PfNames {
 		curName, curRngSt, curRngEnd, err := sriovnetworkv1.ParseVfRange(curPf)
 		if err != nil {
 			return fmt.Errorf("invalid PF name: %s", curPf)
 		}
+		// Resolve altName to actual interface name if nodeState is available
+		if nodeState != nil {
+			curName = sriovnetworkv1.ResolveInterfaceName(curName, nodeState)
+		}
 		for _, prePf := range previous.Spec.NicSelector.PfNames {
 			// Not validate return err for previous PF
 			// since it should already be evaluated in previous run.
 			preName, preRngSt, preRngEnd, _ := sriovnetworkv1.ParseVfRange(prePf)
+			// Resolve altName to actual interface name if nodeState is available
+			if nodeState != nil {
+				preName = sriovnetworkv1.ResolveInterfaceName(preName, nodeState)
+			}
 			if curName == preName {
 				err = validateExternallyManage(current, previous)
 				if err != nil {
@@ -451,8 +523,8 @@ func validateNicModel(selector *sriovnetworkv1.SriovNetworkNicSelector, iface *s
 				pfNames = append(pfNames, p)
 			}
 		}
-		if !sriovnetworkv1.StringInArray(iface.Name, pfNames) {
-			return fmt.Errorf("interface name: %s not found in physical function names", iface.PciAddress)
+		if !sriovnetworkv1.NameOrAltNameMatchesPfNames(iface.Name, iface.AltNames, pfNames) {
+			return fmt.Errorf("interface name: %s (and alternative names) not found in physical function names", iface.Name)
 		}
 	}
 

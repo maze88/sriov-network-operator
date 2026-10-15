@@ -9,6 +9,10 @@ spec:
   selector:
     matchLabels:
       app: sriov-network-metrics-exporter
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 33%
   template:
     metadata:
       labels:
@@ -42,7 +46,7 @@ spec:
         securityContext:
           capabilities:
             drop:
-              - ALL      
+              - ALL
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false
         volumeMounts:
@@ -66,7 +70,14 @@ spec:
         args:
           - --logtostderr
           - --secure-listen-address=[$(HOST_IP)]:{{.MetricsExporterPort}}
-          - --tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_RSA_WITH_AES_128_CBC_SHA256,TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
+          {{- if .TLSCipherSuites }}
+          - --tls-cipher-suites={{.TLSCipherSuites}}
+          {{- end }}
+          {{- if .TLSMinVersion }}
+          - --tls-min-version={{.TLSMinVersion}}
+          {{- end }}
+          # TODO: Add --tls-curve-preferences flag once kube-rbac-proxy supports it.
+          # Tracked by: https://github.com/kube-rbac-proxy/kube-rbac-proxy/issues/414
           - --upstream=http://127.0.0.1:{{.MetricsExporterPort}}/
           - --tls-private-key-file=/etc/metrics/tls.key
           - --tls-cert-file=/etc/metrics/tls.crt
@@ -78,6 +89,9 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: status.hostIP
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
         resources:
           requests:
             cpu: 10m
@@ -86,9 +100,12 @@ spec:
           - name: metrics-certs
             mountPath: /etc/metrics
             readOnly: true
+      tolerations:
+      - operator: Exists
+      priorityClassName: system-node-critical
       nodeSelector:
         {{- range $key, $value := .NodeSelectorField }}
-          {{ $key }}: {{ $value }}
+          {{ $key }}: "{{ $value }}"
         {{- end }}
       restartPolicy: Always
       volumes:

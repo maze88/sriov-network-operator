@@ -1,7 +1,6 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  creationTimestamp: null
   name: sriov-network-operator
 rules:
 - apiGroups:
@@ -11,7 +10,6 @@ rules:
   - services
   - endpoints
   - persistentvolumeclaims
-  - events
   - configmaps
   - secrets
   verbs:
@@ -29,9 +27,21 @@ rules:
   - monitoring.coreos.com
   resources:
   - servicemonitors
+  - prometheusrules
   verbs:
   - get
   - create
+  - update
+  - delete
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  verbs:
+  - get
+  - create
+  - update
+  - delete
 - apiGroups:
   - apps
   resourceNames:
@@ -62,6 +72,14 @@ rules:
   - 'leases'
   verbs:
   - '*'
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+  - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -73,13 +91,11 @@ rules:
   resources:
   - pods
   verbs:
-  - '*'
-- apiGroups:
-  - apps
-  resources:
-  - daemonsets
-  verbs:
-  - '*'
+    - "get"
+    - "list"
+    - "watch"
+    - "delete"
+    - "patch"
 - apiGroups:
   - sriovnetwork.openshift.io
   resources:
@@ -109,12 +125,13 @@ rules:
   verbs:
   - '*'
 - apiGroups:
-    - ""
+  - events.k8s.io
   resources:
-    - events
+  - events
   verbs:
-    - create
-    - patch
+  - create
+  - patch
+  - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

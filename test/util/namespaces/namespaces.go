@@ -10,7 +10,8 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/utils/pointer"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/utils/ptr"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	sriovv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
@@ -29,7 +30,7 @@ var inhibitSecurityAdmissionLabels = map[string]string{
 
 // WaitForDeletion waits until the namespace will be removed from the cluster
 func WaitForDeletion(cs *testclient.ClientSet, nsName string, timeout time.Duration) error {
-	return wait.PollImmediate(time.Second, timeout, func() (bool, error) {
+	return wait.PollUntilContextTimeout(context.Background(), time.Second, timeout, true, func(ctx context.Context) (bool, error) {
 		_, err := cs.Namespaces().Get(context.Background(), nsName, metav1.GetOptions{})
 		if k8serrors.IsNotFound(err) {
 			return true, nil
@@ -79,7 +80,7 @@ func CleanPods(namespace string, cs *testclient.ClientSet) error {
 		return nil
 	}
 	err := cs.Pods(namespace).DeleteCollection(context.Background(), metav1.DeleteOptions{
-		GracePeriodSeconds: pointer.Int64Ptr(0),
+		GracePeriodSeconds: ptr.To[int64](0),
 	}, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to delete pods %v", err)
@@ -128,8 +129,27 @@ func CleanNetworks(operatorNamespace string, cs *testclient.ClientSet) error {
 	return waitForSriovNetworkDeletion(operatorNamespace, cs, 15*time.Second)
 }
 
+func CleanPools(operatorNamespace string, cs *testclient.ClientSet) error {
+	pools := sriovv1.SriovNetworkPoolConfigList{}
+	err := cs.List(context.Background(),
+		&pools,
+		runtimeclient.InNamespace(operatorNamespace))
+	if err != nil {
+		return err
+	}
+	for _, p := range pools.Items {
+		if strings.HasPrefix(p.Name, "test-") {
+			err := cs.Delete(context.Background(), &p)
+			if err != nil {
+				return fmt.Errorf("failed to delete networkPoolConfig %v", err)
+			}
+		}
+	}
+	return err
+}
+
 func waitForSriovNetworkDeletion(operatorNamespace string, cs *testclient.ClientSet, timeout time.Duration) error {
-	return wait.PollImmediate(time.Second, timeout, func() (bool, error) {
+	return wait.PollUntilContextTimeout(context.Background(), time.Second, timeout, true, func(ctx context.Context) (bool, error) {
 		networks := sriovv1.SriovNetworkList{}
 		err := cs.List(context.Background(),
 			&networks,
@@ -163,5 +183,30 @@ func Clean(operatorNamespace, namespace string, cs *testclient.ClientSet, discov
 	if err != nil {
 		return err
 	}
+
+	return CleanPools(operatorNamespace, cs)
+}
+
+func AddLabel(cs corev1client.NamespacesGetter, ctx context.Context, namespaceName, key, value string) error {
+	ns, err := cs.Namespaces().Get(context.Background(), namespaceName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get namespace [%s]: %v", namespaceName, err)
+	}
+
+	if ns.Labels == nil {
+		ns.Labels = make(map[string]string)
+	}
+
+	if ns.Labels[key] == value {
+		return nil
+	}
+
+	ns.Labels[key] = value
+
+	_, err = cs.Namespaces().Update(ctx, ns, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to update namespace [%s] with label [%s: %s]: %v", namespaceName, key, value, err)
+	}
+
 	return nil
 }

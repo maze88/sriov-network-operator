@@ -24,18 +24,14 @@ type hostHelpers struct {
 	mlx.MellanoxInterface
 }
 
-// Use for unit tests
-func NewHostHelpers(utilsHelper utils.CmdInterface,
-	hostManager host.HostManagerInterface,
-	storeManager store.ManagerInterface,
-	mlxHelper mlx.MellanoxInterface) HostHelpersInterface {
-	return &hostHelpers{utilsHelper, hostManager, storeManager, mlxHelper}
-}
-
 func NewDefaultHostHelpers() (HostHelpersInterface, error) {
 	utilsHelper := utils.New()
-	mlxHelper := mlx.New(utilsHelper)
-	hostManager := host.NewHostManager(utilsHelper)
+	hostManager, err := host.NewHostManager(utilsHelper)
+	if err != nil {
+		log.Log.Error(err, "failed to create host manager")
+		return nil, err
+	}
+	mlxHelper := mlx.New(utilsHelper, hostManager)
 	storeManager, err := store.NewManager()
 	if err != nil {
 		log.Log.Error(err, "failed to create store manager")

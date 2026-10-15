@@ -1,13 +1,16 @@
 package vars
 
 import (
+	"errors"
 	"os"
 	"regexp"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/featuregate"
 )
 
 var (
@@ -16,7 +19,7 @@ var (
 
 	// ClusterType used by the operator to specify the platform it's running on
 	// supported values [kubernetes,openshift]
-	ClusterType string
+	ClusterType consts.ClusterType
 
 	// DevMode controls the developer mode in the operator
 	// developer mode allows the operator to use un-supported network devices
@@ -33,6 +36,7 @@ var (
 	// PlatformsMap contains supported platforms for virtual VF
 	PlatformsMap = map[string]consts.PlatformTypes{
 		"openstack": consts.VirtualOpenStack,
+		"aws":       consts.AWS,
 	}
 
 	// SupportedVfIds list of supported virtual functions IDs
@@ -51,8 +55,14 @@ var (
 	// ParallelNicConfig global variable to perform NIC configuration in parallel
 	ParallelNicConfig = false
 
+	// ManageSoftwareBridges global variable which reflects state of manageSoftwareBridges feature
+	ManageSoftwareBridges = false
+
 	// FilesystemRoot used by test to mock interactions with filesystem
 	FilesystemRoot = ""
+
+	// OVSDBSocketPath path to OVSDB socket
+	OVSDBSocketPath = "unix:///var/run/openvswitch/db.sock"
 
 	//Cluster variables
 	Config *rest.Config    = nil
@@ -66,12 +76,25 @@ var (
 
 	// DisableablePlugins contains which plugins can be disabled in sriov config daemon
 	DisableablePlugins = map[string]struct{}{"mellanox": {}}
+
+	// DisableDrain controls if the daemon will drain the node before configuration
+	DisableDrain = false
+
+	// FeatureGates interface to interact with feature gates
+	FeatureGate featuregate.FeatureGate
+
+	// ErrOperationNotSupportedByPlatform is returned when a platform operation is not supported by the platform implementation.
+	ErrOperationNotSupportedByPlatform = errors.New("operation not supported by the platform")
+
+	// UseExternalDrainer controls if SRIOV operator will use an external drainer
+	// for draining nodes or its internal drain controller (default)
+	UseExternalDrainer bool
 )
 
 func init() {
 	Namespace = os.Getenv("NAMESPACE")
 
-	ClusterType = os.Getenv("CLUSTER_TYPE")
+	ClusterType = consts.ClusterType(os.Getenv("CLUSTER_TYPE"))
 
 	DevMode = false
 	mode := os.Getenv("DEV_MODE")
@@ -86,4 +109,17 @@ func init() {
 	}
 
 	ResourcePrefix = os.Getenv("RESOURCE_PREFIX")
+
+	FeatureGate = featuregate.New()
+
+	UseExternalDrainer = os.Getenv("USE_EXTERNAL_DRAINER") == "true"
+}
+
+func GetPlatformType(providerID string) consts.PlatformTypes {
+	for key, pType := range PlatformsMap {
+		if strings.Contains(strings.ToLower(providerID), strings.ToLower(key)) {
+			return pType
+		}
+	}
+	return consts.Baremetal
 }

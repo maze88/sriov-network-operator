@@ -4,10 +4,6 @@ import (
 	goctx "context"
 	"encoding/json"
 	"fmt"
-	"reflect"
-
-	// "strings"
-	// "testing"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +12,7 @@ import (
 	// "github.com/operator-framework/operator-sdk/pkg/test/e2eutil"
 	appsv1 "k8s.io/api/apps/v1"
 	// corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,8 +33,8 @@ var (
 
 func WaitForSriovNetworkNodeStateReady(nodeState *sriovnetworkv1.SriovNetworkNodeState, client client.Client, namespace, name string, retryInterval, timeout time.Duration) error {
 	time.Sleep(30 * time.Second)
-	err := wait.PollImmediate(retryInterval, timeout, func() (done bool, err error) {
-		ctx, cancel := goctx.WithTimeout(goctx.Background(), APITimeout)
+	err := wait.PollUntilContextTimeout(goctx.Background(), retryInterval, timeout, true, func(pollCtx goctx.Context) (done bool, err error) {
+		ctx, cancel := goctx.WithTimeout(pollCtx, APITimeout)
 		defer cancel()
 		err = client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, nodeState)
 		if err != nil {
@@ -60,8 +57,8 @@ func WaitForSriovNetworkNodeStateReady(nodeState *sriovnetworkv1.SriovNetworkNod
 }
 
 func WaitForDaemonSetReady(ds *appsv1.DaemonSet, client client.Client, namespace, name string, retryInterval, timeout time.Duration) error {
-	err := wait.PollImmediate(retryInterval, timeout, func() (done bool, err error) {
-		ctx, cancel := goctx.WithTimeout(goctx.Background(), APITimeout)
+	err := wait.PollUntilContextTimeout(goctx.Background(), retryInterval, timeout, true, func(pollCtx goctx.Context) (done bool, err error) {
+		ctx, cancel := goctx.WithTimeout(pollCtx, APITimeout)
 		defer cancel()
 		err = client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, ds)
 		if err != nil {
@@ -85,8 +82,8 @@ func WaitForDaemonSetReady(ds *appsv1.DaemonSet, client client.Client, namespace
 }
 
 func WaitForNamespacedObject(obj client.Object, client client.Client, namespace, name string, retryInterval, timeout time.Duration) error {
-	err := wait.PollImmediate(retryInterval, timeout, func() (done bool, err error) {
-		ctx, cancel := goctx.WithTimeout(goctx.Background(), APITimeout)
+	err := wait.PollUntilContextTimeout(goctx.Background(), retryInterval, timeout, true, func(pollCtx goctx.Context) (done bool, err error) {
+		ctx, cancel := goctx.WithTimeout(pollCtx, APITimeout)
 		defer cancel()
 		err = client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, obj)
 		if err != nil {
@@ -106,8 +103,8 @@ func WaitForNamespacedObject(obj client.Object, client client.Client, namespace,
 }
 
 func WaitForNamespacedObjectDeleted(obj client.Object, client client.Client, namespace, name string, retryInterval, timeout time.Duration) error {
-	err := wait.PollImmediate(retryInterval, timeout, func() (done bool, err error) {
-		ctx, cancel := goctx.WithTimeout(goctx.Background(), APITimeout)
+	err := wait.PollUntilContextTimeout(goctx.Background(), retryInterval, timeout, true, func(pollCtx goctx.Context) (done bool, err error) {
+		ctx, cancel := goctx.WithTimeout(pollCtx, APITimeout)
 		defer cancel()
 		err = client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, obj)
 		if err != nil {
@@ -229,7 +226,7 @@ func validateSelector(rc *dptypes.NetDeviceSelectors, ns *sriovnetworkv1.SriovNe
 		}
 	}
 	if len(ns.PfNames) > 0 {
-		if !reflect.DeepEqual(ns.PfNames, rc.PfNames) {
+		if !equality.Semantic.DeepEqual(ns.PfNames, rc.PfNames) {
 			return false
 		}
 	}

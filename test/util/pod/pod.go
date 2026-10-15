@@ -8,10 +8,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/remotecommand"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	testclient "github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/client"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/test/util/images"
@@ -26,7 +27,7 @@ func GetDefinition() *corev1.Pod {
 			GenerateName: "testpod-",
 			Namespace:    namespaces.Test},
 		Spec: corev1.PodSpec{
-			TerminationGracePeriodSeconds: pointer.Int64Ptr(0),
+			TerminationGracePeriodSeconds: ptr.To[int64](0),
 			Containers: []corev1.Container{{Name: "test",
 				Image: images.Test(),
 				SecurityContext: &corev1.SecurityContext{
@@ -103,6 +104,31 @@ func RedefineWithCapabilities(pod *corev1.Pod, capabilitiesList []corev1.Capabil
 	return pod
 }
 
+func RedefineWithHugepages(pod *corev1.Pod, hugepagesName string, hugepagesAmount int64) *corev1.Pod {
+	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+		Name: "hugepages",
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{
+				Medium: corev1.StorageMediumHugePages,
+			},
+		},
+	})
+	pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
+		Name:      "hugepages",
+		MountPath: "/hugepages",
+	})
+
+	resources := corev1.ResourceList{
+		corev1.ResourceName(hugepagesName): *resource.NewQuantity(hugepagesAmount, resource.BinarySI),
+		corev1.ResourceCPU:                 *resource.NewMilliQuantity(50, resource.DecimalSI),
+	}
+
+	pod.Spec.Containers[0].Resources.Requests = resources
+	pod.Spec.Containers[0].Resources.Limits = resources
+
+	return pod
+}
+
 // ExecCommand runs command in the pod and returns buffer output
 func ExecCommand(cs *testclient.ClientSet, pod *corev1.Pod, command ...string) (string, string, error) {
 	var buf, errbuf bytes.Buffer
@@ -117,7 +143,6 @@ func ExecCommand(cs *testclient.ClientSet, pod *corev1.Pod, command ...string) (
 			Command:   command,
 			Stdout:    true,
 			Stderr:    true,
-			TTY:       true,
 		}, scheme.ParameterCodec)
 
 	exec, err := remotecommand.NewSPDYExecutor(cs.Config, "POST", req.URL())
@@ -125,10 +150,9 @@ func ExecCommand(cs *testclient.ClientSet, pod *corev1.Pod, command ...string) (
 		return buf.String(), errbuf.String(), err
 	}
 
-	err = exec.Stream(remotecommand.StreamOptions{
+	err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
 		Stdout: &buf,
 		Stderr: &errbuf,
-		Tty:    true,
 	})
 	if err != nil {
 		return buf.String(), errbuf.String(), err

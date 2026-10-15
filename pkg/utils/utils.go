@@ -3,12 +3,16 @@ package utils
 import (
 	"bytes"
 	"fmt"
-	"math/rand"
-	"net"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 	"syscall"
+	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -16,10 +20,19 @@ import (
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
 )
 
+// ovsKeyRegexp restricts OVS other_config keys to characters that are safe when
+// embedded literally in a single-quoted shell string (no quoting applied to keys).
+var ovsKeyRegexp = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+const (
+	httpRequestTimeout = 5 * time.Second
+)
+
 //go:generate ../../bin/mockgen -destination mock/mock_utils.go -source utils.go
 type CmdInterface interface {
 	Chroot(string) (func() error, error)
 	RunCommand(string, ...string) (string, string, error)
+	HTTPGetFetchData(string) (string, error)
 }
 
 type utilsHelper struct {
@@ -29,6 +42,7 @@ func New() CmdInterface {
 	return &utilsHelper{}
 }
 
+// Chroot run a chroot command on a specific path
 func (u *utilsHelper) Chroot(path string) (func() error, error) {
 	root, err := os.Open("/")
 	if err != nil {
@@ -51,6 +65,36 @@ func (u *utilsHelper) Chroot(path string) (func() error, error) {
 	}, nil
 }
 
+func (u *utilsHelper) HTTPGetFetchData(url string) (string, error) {
+	// Initialize an HTTP client with a specific timeout.
+	client := http.Client{
+		Timeout: httpRequestTimeout,
+	}
+
+	// Perform the GET request.
+	resp, err := client.Get(url)
+	if err != nil {
+		// This error typically indicates a network issue or that the server is unreachable.
+		return "", fmt.Errorf("HTTP GET request to %s failed: %w", url, err)
+	}
+	// Ensure the response body is closed after the function returns.
+	defer resp.Body.Close()
+
+	// Check if the HTTP status code is OK (200).
+	if resp.StatusCode != http.StatusOK {
+		// Attempt to read the body for more detailed error information if available.
+		errorBodyBytes, _ := io.ReadAll(resp.Body) // ReadAll might return its own error, but we prioritize the status code error.
+		return "", fmt.Errorf("request to %s returned status %s: %s", url, resp.Status, string(errorBodyBytes))
+	}
+
+	// Read the entire response body.
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body from %s: %w", url, err)
+	}
+	return string(bodyBytes), nil
+}
+
 // RunCommand runs a command
 func (u *utilsHelper) RunCommand(command string, args ...string) (string, string, error) {
 	log.Log.Info("RunCommand()", "command", command, "args", args)
@@ -63,19 +107,6 @@ func (u *utilsHelper) RunCommand(command string, args ...string) (string, string
 	err := cmd.Run()
 	log.Log.V(2).Info("RunCommand()", "output", stdout.String(), "error", err)
 	return stdout.String(), stderr.String(), err
-}
-
-func GenerateRandomGUID() net.HardwareAddr {
-	guid := make(net.HardwareAddr, 8)
-
-	// First field is 0x01 - xfe to avoid all zero and all F invalid guids
-	guid[0] = byte(1 + rand.Intn(0xfe))
-
-	for i := 1; i < len(guid); i++ {
-		guid[i] = byte(rand.Intn(0x100))
-	}
-
-	return guid
 }
 
 func IsCommandNotFound(err error) bool {
@@ -103,4 +134,65 @@ func GetChrootExtension() string {
 		return vars.FilesystemRoot
 	}
 	return fmt.Sprintf("chroot %s%s", vars.FilesystemRoot, consts.Host)
+}
+
+// WriteFileWithTimeout writes data to a file with a timeout.
+// This is useful for writing to sysfs files where the kernel driver may block
+// indefinitely if it is in a bad state.
+// Note: if the timeout expires, the write goroutine will remain blocked in the
+// kernel; it cannot be canceled but will be cleaned up when the process exits.
+func WriteFileWithTimeout(path string, data []byte, perm os.FileMode, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ch := make(chan error, 1)
+	go func() {
+		ch <- os.WriteFile(path, data, perm)
+	}()
+	select {
+	case err := <-ch:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("timeout writing to file %s after %v", path, timeout)
+	}
+}
+
+// ValidateOvsConfig checks that all OVS other_config keys and values are safe
+// for embedding in a shell command. Call this at admission time to surface
+// errors before they reach RenderOtherOvsConfigOption.
+func ValidateOvsConfig(ovsConfig map[string]string) error {
+	for key, value := range ovsConfig {
+		if !ovsKeyRegexp.MatchString(key) {
+			return fmt.Errorf("OVS config key %q is invalid: use only alphanumeric characters, underscores and hyphens", key)
+		}
+		if strings.Contains(value, "'") {
+			return fmt.Errorf("OVS config value for key %q must not contain a single quote", key)
+		}
+	}
+	return nil
+}
+
+// RenderOtherOvsConfigOption formats ovsConfig entries for use in a shell
+// command. Keys must match [a-zA-Z0-9_-] and values must not contain single
+// quotes; both constraints prevent injection into the single-quoted bash -c
+// context where the output is embedded.
+func RenderOtherOvsConfigOption(ovsConfig map[string]string) (string, string, error) {
+	otherConfig := new(bytes.Buffer)
+	keys := make([]string, 0, len(ovsConfig))
+	for key := range ovsConfig {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	err := ValidateOvsConfig(ovsConfig)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid OVS configuration: %v", err)
+	}
+
+	externalIds := make([]string, 0, len(keys))
+	for _, key := range keys {
+		value := ovsConfig[key]
+		fmt.Fprintf(otherConfig, "other_config:%s=%q ", key, value)
+		externalIds = append(externalIds, key)
+	}
+	return strings.Join(externalIds, " "), otherConfig.String(), nil
 }

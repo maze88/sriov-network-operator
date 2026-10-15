@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -26,8 +27,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -38,29 +41,133 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	machinev1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
+	"github.com/go-logr/logr"
+	configv1 "github.com/openshift/api/config/v1"
+	machinev1 "github.com/openshift/api/machineconfiguration/v1"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
-	apply "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/apply"
-	consts "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/apply"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/consts"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/featuregate"
 	snolog "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/log"
-	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/platforms"
-	render "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/render"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/orchestrator"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/render"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/status"
+	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/utils"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/vars"
 )
+
+var errSystemdModeOnHypershift = errors.New("systemd mode is not supported on hypershift")
 
 // SriovOperatorConfigReconciler reconciles a SriovOperatorConfig object
 type SriovOperatorConfigReconciler struct {
 	client.Client
-	Scheme         *runtime.Scheme
-	PlatformHelper platforms.Interface
-	FeatureGate    featuregate.FeatureGate
+	Scheme            *runtime.Scheme
+	Orchestrator      orchestrator.Interface
+	FeatureGate       featuregate.FeatureGate
+	StatusPatcher     status.Interface
+	UncachedAPIReader client.Reader
+	// Test-only hooks let direct reconciler tests inject manifest operations
+	// without mutating shared package-level helpers.
+	renderManifestFn renderManifestFunc
+	applyManifestFn  applyManifestFunc
+	deleteManifestFn applyManifestFunc
+}
+
+// renderManifests renders operator manifests using a reconciler-scoped renderer
+// when one is configured for tests.
+func (r *SriovOperatorConfigReconciler) renderManifests(path string, data *render.RenderData) ([]*uns.Unstructured, error) {
+	if r.renderManifestFn != nil {
+		return r.renderManifestFn(path, data)
+	}
+
+	return render.RenderDir(path, data)
+}
+
+// applyManifest applies a rendered object using a reconciler-scoped applier
+// when one is configured for tests.
+func (r *SriovOperatorConfigReconciler) applyManifest(ctx context.Context, c client.Client, obj *uns.Unstructured) error {
+	if r.applyManifestFn != nil {
+		return r.applyManifestFn(ctx, c, obj)
+	}
+
+	return apply.ApplyObject(ctx, c, obj)
+}
+
+// deleteManifest deletes a rendered object using a reconciler-scoped deleter
+// when one is configured for tests.
+func (r *SriovOperatorConfigReconciler) deleteManifest(ctx context.Context, c client.Client, obj *uns.Unstructured) error {
+	if r.deleteManifestFn != nil {
+		return r.deleteManifestFn(ctx, c, obj)
+	}
+
+	return apply.DeleteObject(ctx, c, obj)
+}
+
+// getTLSTemplateData retrieves TLS configuration data for manifest rendering.
+// It first reads the TLS_CIPHER_SUITES and TLS_MIN_VERSION environment variables
+// and validates them (converting cipher names to IANA format, filtering insecure ciphers,
+// and enforcing TLS 1.2 minimum). Then it calls GetTLSConfig on the orchestrator.
+// If the orchestrator returns a non-nil TLS configuration, it overrides the values from the environment variables.
+// Empty strings are returned when no configuration is set, which means components use their defaults.
+func (r *SriovOperatorConfigReconciler) getTLSTemplateData(ctx context.Context) (map[string]string, error) {
+	logger := log.Log.WithName("getTLSTemplateData")
+
+	result := map[string]string{
+		"TLSCipherSuites":     "",
+		"TLSMinVersion":       "",
+		"TLSCurvePreferences": "",
+	}
+
+	envCiphers := os.Getenv("TLS_CIPHER_SUITES")
+	envMinVersion := os.Getenv("TLS_MIN_VERSION")
+	envCurvePreferences := os.Getenv("TLS_CURVE_PREFERENCES")
+
+	if envCiphers != "" || envMinVersion != "" || envCurvePreferences != "" {
+		envTLSConfig, err := utils.BuildTLSConfig(envCiphers, envMinVersion, envCurvePreferences)
+		if err != nil {
+			return nil, fmt.Errorf("invalid TLS environment variables: %w", err)
+		}
+		if envTLSConfig != nil {
+			result["TLSCipherSuites"] = envTLSConfig.CipherSuites
+			result["TLSMinVersion"] = envTLSConfig.MinTLSVersion
+			result["TLSCurvePreferences"] = envTLSConfig.CurvePreferences
+		}
+	}
+
+	tlsConfig, err := r.Orchestrator.GetTLSConfig(ctx)
+	if err != nil {
+		logger.Error(err, "Failed to get TLS config from orchestrator")
+		return nil, fmt.Errorf("failed to get TLS config from orchestrator: %w", err)
+	}
+
+	if tlsConfig != nil {
+		logger.V(2).Info("Orchestrator returned TLS config, overriding environment variables")
+		result["TLSCipherSuites"] = tlsConfig.CipherSuites
+		result["TLSMinVersion"] = tlsConfig.MinTLSVersion
+		result["TLSCurvePreferences"] = tlsConfig.CurvePreferences
+	}
+
+	if result["TLSCurvePreferences"] != "" {
+		numericIDs, err := utils.CurveNamesToIDs(result["TLSCurvePreferences"])
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert curve preference names to IDs: %w", err)
+		}
+		result["TLSCurvePreferences"] = numericIDs
+	}
+
+	logger.V(2).Info("TLS config",
+		"TLSCipherSuites", result["TLSCipherSuites"],
+		"TLSMinVersion", result["TLSMinVersion"],
+		"TLSCurvePreferences", result["TLSCurvePreferences"])
+	return result, nil
 }
 
 //+kubebuilder:rbac:groups=sriovnetwork.openshift.io,resources=sriovoperatorconfigs,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=sriovnetwork.openshift.io,resources=sriovoperatorconfigs/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=sriovnetwork.openshift.io,resources=sriovoperatorconfigs/finalizers,verbs=update
+//+kubebuilder:rbac:groups=config.openshift.io,resources=apiservers;infrastructures,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -71,13 +178,13 @@ type SriovOperatorConfigReconciler struct {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.8.3/pkg/reconcile
-func (r *SriovOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *SriovOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	logger := log.FromContext(ctx).WithValues("sriovoperatorconfig", req.NamespacedName)
 	logger.Info("Reconciling SriovOperatorConfig")
 
 	// Note: in SetupWithManager we setup manager to enqueue only default config obj
 	defaultConfig := &sriovnetworkv1.SriovOperatorConfig{}
-	err := r.Get(ctx, req.NamespacedName, defaultConfig)
+	err = r.Get(ctx, req.NamespacedName, defaultConfig)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Info("default SriovOperatorConfig object not found. waiting for creation.")
@@ -89,6 +196,26 @@ func (r *SriovOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.
 	}
 
 	snolog.SetLogLevel(defaultConfig.Spec.LogLevel)
+
+	defer func() {
+		conditionErr := r.applyReadyCondition(ctx, defaultConfig, err)
+		if conditionErr == nil {
+			return
+		}
+
+		logger.Error(conditionErr, "Failed to apply Ready condition")
+		err = errors.Join(err, conditionErr)
+	}()
+
+	// examine DeletionTimestamp to determine if object is under deletion
+	if !defaultConfig.ObjectMeta.DeletionTimestamp.IsZero() {
+		// The object is being deleted
+		return r.handleSriovOperatorConfigDeletion(ctx, defaultConfig, logger)
+	}
+
+	if err = r.syncOperatorConfigFinalizers(ctx, defaultConfig, logger); err != nil {
+		return reconcile.Result{}, err
+	}
 
 	r.FeatureGate.Init(defaultConfig.Spec.FeatureGates)
 	logger.Info("enabled featureGates", "featureGates", r.FeatureGate.String())
@@ -124,7 +251,7 @@ func (r *SriovOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.
 		return reconcile.Result{}, err
 	}
 
-	if err = syncPluginDaemonObjs(ctx, r.Client, r.Scheme, defaultConfig, policyList); err != nil {
+	if err = syncPluginDaemonObjs(ctx, r.Client, r.Scheme, defaultConfig, r.FeatureGate, r.renderManifests, r.applyManifest); err != nil {
 		return reconcile.Result{}, err
 	}
 
@@ -133,10 +260,11 @@ func (r *SriovOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.
 	}
 
 	// For Openshift we need to create the systemd files using a machine config
-	if vars.ClusterType == consts.ClusterTypeOpenshift {
+	if r.Orchestrator.ClusterType() == consts.ClusterTypeOpenshift {
 		// TODO: add support for hypershift as today there is no MCO on hypershift clusters
-		if r.PlatformHelper.IsHypershift() {
-			return ctrl.Result{}, fmt.Errorf("systemd mode is not supported on hypershift")
+		if defaultConfig.Spec.ConfigurationMode == sriovnetworkv1.SystemdConfigurationMode &&
+			r.Orchestrator.Flavor() == consts.ClusterFlavorHypershift {
+			return ctrl.Result{}, errSystemdModeOnHypershift
 		}
 
 		if err = r.syncOpenShiftSystemdService(ctx, defaultConfig); err != nil {
@@ -146,6 +274,32 @@ func (r *SriovOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	logger.Info("Reconcile SriovOperatorConfig completed successfully")
 	return reconcile.Result{RequeueAfter: consts.ResyncPeriod}, nil
+}
+
+// applyReadyCondition updates the shared Ready condition for SriovOperatorConfig
+// using the shared SSA status patcher.
+func (r *SriovOperatorConfigReconciler) applyReadyCondition(ctx context.Context, config *sriovnetworkv1.SriovOperatorConfig, reconcileErr error) error {
+	conditionStatus := metav1.ConditionTrue
+	reason := sriovnetworkv1.ReasonOperatorConfigReady
+	message := "SriovOperatorConfig reconciled successfully"
+
+	if reconcileErr != nil {
+		conditionStatus = metav1.ConditionFalse
+		message = reconcileErr.Error()
+		if errors.Is(reconcileErr, errSystemdModeOnHypershift) {
+			reason = sriovnetworkv1.ReasonUnsupportedConfiguration
+		} else {
+			reason = sriovnetworkv1.ReasonOperatorConfigSyncFailed
+		}
+	}
+
+	err := r.StatusPatcher.ApplyCondition(ctx, config,
+		status.NewCondition(sriovnetworkv1.ConditionReady, conditionStatus, reason, message, config.GetGeneration()))
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	return err
 }
 
 // defaultConfigPredicate creates a predicate.Predicate that will return true
@@ -161,11 +315,41 @@ func defaultConfigPredicate() predicate.Predicate {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *SriovOperatorConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&sriovnetworkv1.SriovOperatorConfig{}, ctrl_builder.WithPredicates(defaultConfigPredicate())).
 		Owns(&appsv1.DaemonSet{}).
-		Owns(&corev1.ConfigMap{}).
-		Complete(r)
+		Owns(&corev1.ConfigMap{})
+
+	// Watch for APIServer changes on OpenShift to react to TLS profile changes.
+	// Only add the watch if the APIServer CRD is available in the cluster.
+	if r.Orchestrator.ClusterType() == consts.ClusterTypeOpenshift && r.isAPIServerCRDAvailable(mgr) {
+		log.Log.WithName("SetupWithManager").V(2).Info("Watching for OpenShift APIServer changes to react on TLS profile updates")
+		builder = builder.Watches(
+			&configv1.APIServer{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return []reconcile.Request{{NamespacedName: types.NamespacedName{
+					Namespace: vars.Namespace,
+					Name:      consts.DefaultConfigName,
+				}}}
+			}),
+		)
+	}
+
+	return builder.Complete(r)
+}
+
+// isAPIServerCRDAvailable checks if the OpenShift APIServer CRD is available in the cluster.
+func (r *SriovOperatorConfigReconciler) isAPIServerCRDAvailable(mgr ctrl.Manager) bool {
+	log.Log.WithName("isAPIServerCRDAvailable").V(2).Info("Checking if OpenShift APIServer CRD is available")
+	gvk := configv1.SchemeGroupVersion.WithKind("APIServer")
+
+	_, err := mgr.GetRESTMapper().RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		log.Log.V(2).Info("APIServer CRD not available, skipping watch", "error", err.Error())
+		return false
+	}
+	log.Log.WithName("isAPIServerCRDAvailable").V(2).Info("OpenShift APIServer CRD is available")
+	return true
 }
 
 func (r *SriovOperatorConfigReconciler) syncConfigDaemonSet(ctx context.Context, dc *sriovnetworkv1.SriovOperatorConfig) error {
@@ -178,9 +362,11 @@ func (r *SriovOperatorConfigReconciler) syncConfigDaemonSet(ctx context.Context,
 	data.Data["SRIOVCNIImage"] = os.Getenv("SRIOV_CNI_IMAGE")
 	data.Data["SRIOVInfiniBandCNIImage"] = os.Getenv("SRIOV_INFINIBAND_CNI_IMAGE")
 	data.Data["OVSCNIImage"] = os.Getenv("OVS_CNI_IMAGE")
+	data.Data["RDMACNIImage"] = os.Getenv("RDMA_CNI_IMAGE")
 	data.Data["ReleaseVersion"] = os.Getenv("RELEASEVERSION")
 	data.Data["ClusterType"] = vars.ClusterType
 	data.Data["DevMode"] = os.Getenv("DEV_MODE")
+	data.Data["UseExternalDrainer"] = vars.UseExternalDrainer
 	data.Data["ImagePullSecrets"] = GetImagePullSecrets()
 	if dc.Spec.ConfigurationMode == sriovnetworkv1.SystemdConfigurationMode {
 		data.Data["UsedSystemdMode"] = true
@@ -188,6 +374,7 @@ func (r *SriovOperatorConfigReconciler) syncConfigDaemonSet(ctx context.Context,
 		data.Data["UsedSystemdMode"] = false
 	}
 	data.Data["ParallelNicConfig"] = r.FeatureGate.IsEnabled(consts.ParallelNicConfigFeatureGate)
+	data.Data["ManageSoftwareBridges"] = r.FeatureGate.IsEnabled(consts.ManageSoftwareBridgesFeatureGate)
 
 	envCniBinPath := os.Getenv("SRIOV_CNI_BIN_PATH")
 	if envCniBinPath == "" {
@@ -202,7 +389,9 @@ func (r *SriovOperatorConfigReconciler) syncConfigDaemonSet(ctx context.Context,
 		data.Data["DisablePlugins"] = strings.Join(dc.Spec.DisablePlugins.ToStringSlice(), ",")
 	}
 
-	objs, err := render.RenderDir(consts.ConfigDaemonPath, &data)
+	data.Data["ConfigDaemonEnvVars"] = dc.Spec.ConfigDaemonEnvVars
+
+	objs, err := r.renderManifests(consts.ConfigDaemonPath, &data)
 	if err != nil {
 		logger.Error(err, "Fail to render config daemon manifests")
 		return err
@@ -228,6 +417,10 @@ func (r *SriovOperatorConfigReconciler) syncConfigDaemonSet(ctx context.Context,
 func (r *SriovOperatorConfigReconciler) syncMetricsExporter(ctx context.Context, dc *sriovnetworkv1.SriovOperatorConfig) error {
 	logger := log.Log.WithName("syncMetricsExporter")
 	logger.V(1).Info("Start to sync metrics exporter")
+	tlsData, err := r.getTLSTemplateData(ctx)
+	if err != nil {
+		return err
+	}
 
 	data := render.MakeRenderData()
 	data.Data["Image"] = os.Getenv("METRICS_EXPORTER_IMAGE")
@@ -236,20 +429,29 @@ func (r *SriovOperatorConfigReconciler) syncMetricsExporter(ctx context.Context,
 	data.Data["MetricsExporterSecretName"] = os.Getenv("METRICS_EXPORTER_SECRET_NAME")
 	data.Data["MetricsExporterPort"] = os.Getenv("METRICS_EXPORTER_PORT")
 	data.Data["MetricsExporterKubeRbacProxyImage"] = os.Getenv("METRICS_EXPORTER_KUBE_RBAC_PROXY_IMAGE")
-	data.Data["ClusterType"] = vars.ClusterType
+
+	data.Data["IsOpenshift"] = r.Orchestrator.ClusterType() == consts.ClusterTypeOpenshift
+
+	data.Data["IsPrometheusOperatorInstalled"] = strings.ToLower(os.Getenv("METRICS_EXPORTER_PROMETHEUS_OPERATOR_ENABLED")) == trueString
+	data.Data["PrometheusOperatorDeployRules"] = strings.ToLower(os.Getenv("METRICS_EXPORTER_PROMETHEUS_DEPLOY_RULES")) == trueString
+	data.Data["PrometheusOperatorServiceAccount"] = os.Getenv("METRICS_EXPORTER_PROMETHEUS_OPERATOR_SERVICE_ACCOUNT")
+	data.Data["PrometheusOperatorNamespace"] = os.Getenv("METRICS_EXPORTER_PROMETHEUS_OPERATOR_NAMESPACE")
+	data.Data["TLSCipherSuites"] = tlsData["TLSCipherSuites"]
+	data.Data["TLSMinVersion"] = tlsData["TLSMinVersion"]
+	data.Data["TLSCurvePreferences"] = tlsData["TLSCurvePreferences"]
+
 	data.Data["NodeSelectorField"] = GetDefaultNodeSelector()
 	if dc.Spec.ConfigDaemonNodeSelector != nil {
 		data.Data["NodeSelectorField"] = dc.Spec.ConfigDaemonNodeSelector
 	}
 
-	objs, err := render.RenderDir(consts.MetricsExporterPath, &data)
+	objs, err := r.renderManifests(consts.MetricsExporterPath, &data)
 	if err != nil {
 		logger.Error(err, "Fail to render metrics exporter manifests")
 		return err
 	}
 
-	deployMetricsExporter, ok := dc.Spec.FeatureGates[consts.MetricsExporterFeatureGate]
-	if ok && deployMetricsExporter {
+	if r.FeatureGate.IsEnabled(consts.MetricsExporterFeatureGate) {
 		for _, obj := range objs {
 			err = r.syncK8sResource(ctx, dc, obj)
 			if err != nil {
@@ -257,14 +459,13 @@ func (r *SriovOperatorConfigReconciler) syncMetricsExporter(ctx context.Context,
 				return err
 			}
 		}
+
 		return nil
 	}
 
-	for _, obj := range objs {
-		err = r.deleteK8sResource(ctx, obj)
-		if err != nil {
-			return err
-		}
+	err = r.deleteK8sResources(ctx, objs)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -273,6 +474,12 @@ func (r *SriovOperatorConfigReconciler) syncMetricsExporter(ctx context.Context,
 func (r *SriovOperatorConfigReconciler) syncWebhookObjs(ctx context.Context, dc *sriovnetworkv1.SriovOperatorConfig) error {
 	logger := log.Log.WithName("syncWebhookObjs")
 	logger.V(1).Info("Start to sync webhook objects")
+
+	// Get TLS configuration data
+	tlsData, err := r.getTLSTemplateData(ctx)
+	if err != nil {
+		return err
+	}
 
 	for name, path := range webhooks {
 		// Render Webhook manifests
@@ -291,16 +498,33 @@ func (r *SriovOperatorConfigReconciler) syncWebhookObjs(ctx context.Context, dc 
 		data.Data["InjectorWebhookSecretName"] = os.Getenv("ADMISSION_CONTROLLERS_CERTIFICATES_INJECTOR_SECRET_NAME")
 		data.Data["InjectorWebhookCA"] = os.Getenv("ADMISSION_CONTROLLERS_CERTIFICATES_INJECTOR_CA_CRT")
 
+		operatorWebhookPort := os.Getenv("OPERATOR_WEBHOOK_NETWORK_POLICY_PORT")
+		if operatorWebhookPort == "" {
+			operatorWebhookPort = "6443"
+		}
+		data.Data["OperatorWebhookNetworkPolicyPort"] = operatorWebhookPort
+
+		injectorWebhookPort := os.Getenv("INJECTOR_WEBHOOK_NETWORK_POLICY_PORT")
+		if injectorWebhookPort == "" {
+			injectorWebhookPort = "6443"
+		}
+		data.Data["InjectorWebhookNetworkPolicyPort"] = injectorWebhookPort
+
 		data.Data["ExternalControlPlane"] = false
-		if r.PlatformHelper.IsOpenshiftCluster() {
-			external := r.PlatformHelper.IsHypershift()
-			data.Data["ExternalControlPlane"] = external
+		if r.Orchestrator.ClusterType() == consts.ClusterTypeOpenshift &&
+			r.Orchestrator.Flavor() == consts.ClusterFlavorHypershift {
+			data.Data["ExternalControlPlane"] = true
 		}
 
 		// check for ResourceInjectorMatchConditionFeatureGate feature gate
 		data.Data[consts.ResourceInjectorMatchConditionFeatureGate] = r.FeatureGate.IsEnabled(consts.ResourceInjectorMatchConditionFeatureGate)
 
-		objs, err := render.RenderDir(path, &data)
+		// TLS configuration data
+		data.Data["TLSCipherSuites"] = tlsData["TLSCipherSuites"]
+		data.Data["TLSMinVersion"] = tlsData["TLSMinVersion"]
+		data.Data["TLSCurvePreferences"] = tlsData["TLSCurvePreferences"]
+
+		objs, err := r.renderManifests(path, &data)
 		if err != nil {
 			logger.Error(err, "Fail to render webhook manifests")
 			return err
@@ -354,8 +578,18 @@ func (r *SriovOperatorConfigReconciler) deleteWebhookObject(ctx context.Context,
 }
 
 func (r *SriovOperatorConfigReconciler) deleteK8sResource(ctx context.Context, in *uns.Unstructured) error {
-	if err := apply.DeleteObject(ctx, r.Client, in); err != nil {
+	if err := r.deleteManifest(ctx, r.Client, in); err != nil {
 		return fmt.Errorf("failed to delete object %v with err: %v", in, err)
+	}
+	return nil
+}
+
+func (r *SriovOperatorConfigReconciler) deleteK8sResources(ctx context.Context, objs []*uns.Unstructured) error {
+	for _, obj := range objs {
+		err := r.deleteK8sResource(ctx, obj)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -369,7 +603,7 @@ func (r *SriovOperatorConfigReconciler) syncK8sResource(ctx context.Context, cr 
 			return err
 		}
 	}
-	if err := apply.ApplyObject(ctx, r.Client, in); err != nil {
+	if err := r.applyManifest(ctx, r.Client, in); err != nil {
 		return fmt.Errorf("failed to apply object %v with err: %v", in, err)
 	}
 	return nil
@@ -381,7 +615,8 @@ func (r *SriovOperatorConfigReconciler) syncOpenShiftSystemdService(ctx context.
 
 	if cr.Spec.ConfigurationMode != sriovnetworkv1.SystemdConfigurationMode {
 		obj := &machinev1.MachineConfig{}
-		err := r.Get(context.TODO(), types.NamespacedName{Name: consts.SystemdServiceOcpMachineConfigName}, obj)
+		// use uncached api reader to get machineconfig to reduce memory footprint
+		err := r.UncachedAPIReader.Get(ctx, types.NamespacedName{Name: consts.SystemdServiceOcpMachineConfigName}, obj)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil
@@ -392,7 +627,7 @@ func (r *SriovOperatorConfigReconciler) syncOpenShiftSystemdService(ctx context.
 		}
 
 		logger.Info("Systemd service was deployed but the operator is now operating on daemonset mode, removing the machine config")
-		err = r.Delete(context.TODO(), obj)
+		err = r.Delete(ctx, obj)
 		if err != nil {
 			logger.Error(err, "failed to remove the systemd service machine config")
 			return err
@@ -404,7 +639,7 @@ func (r *SriovOperatorConfigReconciler) syncOpenShiftSystemdService(ctx context.
 	logger.Info("Start to sync config systemd machine config for openshift")
 	data := render.MakeRenderData()
 	data.Data["LogLevel"] = cr.Spec.LogLevel
-	objs, err := render.RenderDir(consts.SystemdServiceOcpPath, &data)
+	objs, err := r.renderManifests(consts.SystemdServiceOcpPath, &data)
 	if err != nil {
 		logger.Error(err, "Fail to render config daemon manifests")
 		return err
@@ -412,6 +647,50 @@ func (r *SriovOperatorConfigReconciler) syncOpenShiftSystemdService(ctx context.
 
 	// Sync machine config
 	return r.setLabelInsideObject(ctx, cr, objs)
+}
+
+func (r SriovOperatorConfigReconciler) syncOperatorConfigFinalizers(ctx context.Context, defaultConfig *sriovnetworkv1.SriovOperatorConfig, logger logr.Logger) error {
+	if sriovnetworkv1.StringInArray(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers) {
+		return nil
+	}
+
+	newObj := defaultConfig.DeepCopyObject().(client.Object)
+	newObj.SetFinalizers(
+		append(newObj.GetFinalizers(), sriovnetworkv1.OPERATORCONFIGFINALIZERNAME),
+	)
+
+	logger.WithName("syncOperatorConfigFinalizers").
+		Info("Adding finalizer", "key", sriovnetworkv1.OPERATORCONFIGFINALIZERNAME)
+
+	patch := client.MergeFrom(defaultConfig)
+	err := r.Patch(ctx, newObj, patch)
+	if err != nil {
+		return fmt.Errorf("can't patch SriovOperatorConfig to add finalizer [%s]: %w", sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, err)
+	}
+
+	// Refresh the defaultConfig object with the latest changes
+	return r.Get(ctx, types.NamespacedName{Namespace: defaultConfig.Namespace, Name: defaultConfig.Name}, defaultConfig)
+}
+
+func (r *SriovOperatorConfigReconciler) handleSriovOperatorConfigDeletion(ctx context.Context,
+	defaultConfig *sriovnetworkv1.SriovOperatorConfig, logger logr.Logger) (ctrl.Result, error) {
+	var err error
+	if sriovnetworkv1.StringInArray(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers) {
+		// our finalizer is present, so lets handle any external dependency
+		logger.Info("delete SriovOperatorConfig CR", "Namespace", defaultConfig.Namespace, "Name", defaultConfig.Name)
+		// make sure webhooks objects are deleted prior of removing finalizer
+		err = r.deleteAllWebhooks(ctx)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		// remove our finalizer from the list and update it.
+		defaultConfig.ObjectMeta.Finalizers, _ = sriovnetworkv1.RemoveString(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers)
+		if err := r.Update(ctx, defaultConfig); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
+	return reconcile.Result{}, err
 }
 
 func (r SriovOperatorConfigReconciler) setLabelInsideObject(ctx context.Context, cr *sriovnetworkv1.SriovOperatorConfig, objs []*uns.Unstructured) error {
@@ -440,4 +719,30 @@ func (r SriovOperatorConfigReconciler) setLabelInsideObject(ctx context.Context,
 	}
 
 	return nil
+}
+
+func (r SriovOperatorConfigReconciler) deleteAllWebhooks(ctx context.Context) error {
+	var err error
+	obj := &uns.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Kind: "MutatingWebhookConfiguration", Version: "v1"})
+	obj.SetName(consts.OperatorWebHookName)
+	err = errors.Join(
+		err, r.deleteWebhookObject(ctx, obj),
+	)
+
+	obj = &uns.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Kind: "ValidatingWebhookConfiguration", Version: "v1"})
+	obj.SetName(consts.OperatorWebHookName)
+	err = errors.Join(
+		err, r.deleteWebhookObject(ctx, obj),
+	)
+
+	obj = &uns.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Kind: "MutatingWebhookConfiguration", Version: "v1"})
+	obj.SetName(consts.InjectorWebHookName)
+	err = errors.Join(
+		err, r.deleteWebhookObject(ctx, obj),
+	)
+
+	return err
 }
